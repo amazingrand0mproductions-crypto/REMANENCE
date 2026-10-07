@@ -2,11 +2,38 @@
 
 **An original AI Dungeon script for lasting story memory, changing facts and NPCs with separate knowledge, beliefs and motivations.**
 
-REMANENCE v2.0.0 combines evidence-based memory with character continuity. It captures selected complete story excerpts, keeps important canon protected, retrieves older episodes, follows explicit relationship links and gives each NPC a small, private set of knowledge and motivations. Updates happen inside ordinary responses; you do not need to insert extra Continue turns.
+REMANENCE v2.1.1 combines evidence-based memory with character continuity. It captures selected complete story excerpts, keeps important canon protected, retrieves older episodes, follows explicit relationship links and gives each NPC a small, private set of knowledge and motivations. Updates happen inside ordinary responses; you do not need to insert extra Continue turns.
 
 The name refers to something that remains after its original source has passed. This is a substantial expansion and rename of CONTINUITY v1. Existing state and generated settings migrate automatically.
 
 [Install](INSTALL.md) · [Commands](#commands) · [Settings](docs/SETTINGS.md) · [Research](docs/RESEARCH.md) · [Validation](docs/TEST_REPORT.md) · [Offline archive](docs/OFFLINE_MEMORY.md)
+
+## What's fixed in 2.1.1
+
+| Area | Correction |
+| --- | --- |
+| Private learning and beliefs | Recognised unquoted claims about a registered owner are excluded from public memory, including model memory entries, suppressed claims, oversized beliefs and disabled direct capture. |
+| Existing duplicate records | Upgrade and restore repair automatic public copies only when matching private ownership and source provenance already exist. Protected copy IDs survive with corrected private scope; authored public decisions remain intact. |
+| Model belief updates | The entire supported claim must match. Copied names and shortened fragments are rejected; accepted values reuse the original claim and its negation. |
+| Changing settings | Turning minds or model updates off between Context and Output cancels the pending footer. |
+| Empty responses | An empty response while the engine is disabled produces a retry report. Ordinary prose passes through. |
+| Replay verification | Waits for output streams to close before parsing results, rejects failed child processes and measures its output limit in UTF-8 bytes. |
+
+## What's improved since 2.0
+
+| Area | Original 2.0 | Revised 2.1 |
+| --- | --- | --- |
+| General capture | Up to 3 selected sentences per action; 4,000 characters / 24 candidates. | Default 8 sentences, configurable to 16; 12,000 characters by default, configurable to 20,000; up to 96 candidates. |
+| NPC learning and beliefs | Manual commands or a cooperative model footer. | Explicit named-character statements are also captured directly during normal prose, with independent switches. |
+| Recall wording | Literal terms and a small synonym map. | Adds common English inflections and occupation, location, code and awareness vocabulary. Exact numeric details receive priority. |
+| Crowded prompts | Straight relevance ordering. | Reduces repetitive unprotected evidence and puts the newest input first in the query. |
+| Current state | Newest retained version could resurface after a later value was lost. | Retained earlier values become historical only if the current head is evicted. Source undo or explicit reaffirmation can recover a supported earlier value. |
+| Grounding | Normalized source substring. | Private/model mind evidence must match a complete unquoted source sentence. Quote state spans multiple sentences. |
+| Repeated commands | Repeated canon/knowledge/mind commands could consume additional records. | Identical protected facts, unkeyed manual knowledge and current manual directions reuse their records. |
+| Failed writes | Error logging and narrative fallback. | Mutating slash commands roll back engine memory/settings and return a visible failure report. |
+| Search/state | Rebuilt lexical text and a character-count storage guard. | Stored token indexes, compact archive terms, per-hook identity/view caches and a UTF-8 byte guard. |
+
+The release includes [25 targeted improvement probes](docs/RECALL_RESULTS.json): the original 2.0 release passed 11; this release passes 25. They exercise chosen capture, recall and ownership cases, including automatic learning/belief exclusion from public recall. They are **not** a general accuracy percentage, live model evaluation or Inner Self comparison.
 
 ## Install in five minutes
 
@@ -46,8 +73,8 @@ On mobile, use the website and request the desktop site if necessary. Install in
 | Protected canon | Player-established facts survive ordinary eviction. Keyed attributes retain a current value and a historical timeline. |
 | Changing world state | Recognizes narrow, literal statements about known characters' address, occupation, location and life status. Quotes, speculation and attempted Do/Say actions stay evidence. |
 | Relationship recall | Traverses up to two hops of explicit relationships to find related evidence. It never treats co-occurrence as a relationship or grants shared knowledge. |
-| Private NPC knowledge | Learning is assigned to one named owner. World recall excludes private records. |
-| NPC beliefs | Stores what a character thinks or suspects, including false beliefs. A belief is never established world truth. |
+| Private NPC knowledge | Explicit learning, seeing, hearing, reading and witnessing can be captured directly for a registered named owner. World recall excludes private records. |
+| NPC beliefs | Captures named-character believes/thinks/suspects statements as private, potentially false claims. Explicit withdrawals clear exact matching current claims and retain their history. A belief is never established world truth. |
 | Living minds | Maintains a short goal, feeling and tentative intention per NPC. Optional model updates use grounded evidence from the same response. |
 | Commitments | Tracks explicit promises and manually authored threads. Resolution is explicit; the engine does not force plot outcomes. |
 | Possessions | Tracks manual item ownership and transfers with a single current holder. |
@@ -187,21 +214,29 @@ Register private owners first. Supported import kinds are observation, intent, k
 | Balanced, default | 600 / 160,000 | 800 / 180,000 | 3,600 / 22% |
 | Deep | 1,000 / 250,000 | 1,200 / 300,000 | 6,000 / 28% |
 
-Defaults allow 80 protected records, 48 NPC profiles and 60 open threads. These are independent caps, not guaranteed simultaneous retention. A one-million-character serialized-engine guard can prune earlier, especially when records contain many source/identity fields. Export temporarily caches one additional snapshot. JSON size is not sandbox heap usage.
+Defaults allow 80 protected records, 48 NPC profiles and 60 open threads. These are independent caps, not guaranteed simultaneous retention. A one-million-byte UTF-8 serialized-engine guard can prune earlier, including the search indexes and source/identity fields. Export temporarily caches one additional snapshot; reports also add small control data. JSON size is not sandbox heap usage.
 
-Pruning favors protected canon, current motivations/beliefs, open commitments and useful evidence. Suitable unprotected evictions move into the archive; archive count/text limits eventually remove lower-value episodes. Counters in `/status` report both stages. Lowering capacities can remove unprotected data.
+Pruning favors protected canon, current state, motivations/beliefs, manually specified NPC knowledge, open commitments and useful evidence. Suitable unprotected evictions move into the archive; archive count/text limits eventually remove lower-value episodes. Counters in `/status` report both stages. Lowering capacities can remove unprotected data. If a current keyed value is lost, retained earlier versions are marked historical only; capacity loss does not silently make an old address or motivation current again.
 
 Stored memory and model context are different. Every prompt receives only a bounded selection; even protected facts cannot all fit. `/why` explains selection and **View Context** verifies actual delivery. If essential instructions must apply every turn, put them in Plot Essentials.
 
 ## How NPC updates stay smooth
 
-One eligible NPC can receive a small update request at the configured interval. The normal model response may append a reserved JSON footer; REMANENCE removes that footer from visible prose.
+Direct capture works even with `modelUpdates = false`. A registered character's affirmative unquoted sentence such as “Ruth Barker reads the dispatch and learns the gate code is 7619.” supplies scoped awareness. “Ruth Barker suspects Dan Barker stole the dispatch.” supplies a private belief. Awareness of an allegation does not verify it. Recognised learning and belief statements are excluded from ordinary public memory even if a direct-capture switch is off, the claim is suppressed or too large, or structured extraction reaches its limit.
 
-Knowledge requires an exact same-response evidence excerpt showing the selected character learning, seeing, hearing or another supported awareness action. Beliefs require an explicit same-response statement such as “Ruth Barker suspects…” and a copied claim. Goals, feelings and intentions remain tentative interpretations.
+The model cannot use a `memories` entry to make those private sentences public. Its `knowledge` and `beliefs` entries must pass owner and whole-sentence checks; a belief must copy the complete supported claim. These rules control stored and recalled excerpts. Original prose remains in adventure history and may still appear in the model's context.
+
+Questions, requested Do/Say actions, conditional statements, dreams, quoted dialogue and reports about somebody else's awareness cannot grant automatic knowledge. Negating a learning verb cannot grant knowledge. An explicit learned or believed negative claim can still be stored. Unique aliases can work, while ambiguous names and the player are excluded. Pronoun-only and indirect learning remain outside these narrow rules.
+
+A complete narrator sentence such as “Ruth Barker no longer suspects Dan Barker stole the dispatch.” withdraws Ruth's exact matching keyed belief. The parser also accepts “does not believe” and “stopped suspecting” forms. It retains the old claim and withdrawal as private history, restores the earlier retained claim on recent undo, and accepts later explicit reaffirmation. Matching ignores case, spacing, a leading “that” and a final period; it does not infer that differently worded beliefs contradict one another. A negated belief verb without a matching current claim creates no belief. Unkeyed imported beliefs require manual correction or forgetting.
+
+One eligible NPC can receive a small update request at the configured minimum interval. For intervals above one, every fourth interval waits one extra output to avoid repeatedly selecting the same character in a rotating cast. The normal model response may append a reserved JSON footer; REMANENCE removes that footer from visible prose.
+
+Footer knowledge requires a complete unquoted same-response sentence showing the selected character learning, seeing, hearing or another supported awareness action. Beliefs require an explicit same-response statement such as “Ruth Barker suspects…” and a copied claim. A bare substring clipped out of a quote or condition is insufficient. Goals, feelings and intentions remain tentative interpretations.
 
 Stale nonces, unsupported keys, wrong owners, fabricated evidence, duplicate/truncated metadata and invalid JSON are rejected. Narrative prose still passes through. Metadata-only output produces a visible retry report rather than inventing a scene.
 
-If a model rarely follows the footer request, use `/status`, increase response length where available, adjust `updateEvery` or set `modelUpdates = false`. Manual knowledge/mind commands and ordinary evidence capture continue. No extra model service is called.
+If a model rarely follows the footer request, use `/status`, increase response length where available, adjust `updateEvery` or set `modelUpdates = false`. Direct knowledge/belief capture, manual NPC commands and ordinary evidence capture continue. No extra model service is called.
 
 ## Full text beyond the script
 
@@ -225,7 +260,9 @@ node tools/merge-cards.mjs your-cards.json merged-cards.json
 
 Inspect and import the merged result. The tool preserves authored entries and refuses output-file overwrite. It replaces engine-owned settings cards from either brand with the current generated defaults; keep automatic in-adventure migration if you want to preserve customized settings. Supported source world types are location, item, faction, lore and world, or cards tagged `[WORLD]`. Notes tagged `[PRIVATE]` or `[SECRET]` exclude the card from REMANENCE indexing. This does not change AI Dungeon's independent native card activation.
 
-## Upgrade from CONTINUITY v1
+## Upgrade from earlier releases
+
+For REMANENCE 2.0, back up and replace all four tabs together. Keep the existing settings cards. State remains at schema 2; the next hook preserves existing values, adds the five new options, refreshes engine-generated Notes and rebuilds indexes once. Authored/custom Notes are preserved.
 
 Back up first. Replace all four script tabs together; keep your existing settings cards. On the next hook, valid `state.continuityV1` is migrated to `state.remanenceV2`, and engine-owned configuration cards are renamed in place. Existing canon, NPCs and settings are retained; new options receive defaults. Unsupported future/damaged state is preserved rather than silently reset.
 
@@ -233,20 +270,25 @@ The legacy `/continuity on/off` command remains an alias. Legacy footer/status m
 
 ## Verification and honest limits
 
-The latest build passes **98 regression tests and a 100-turn smoke replay**. An earlier build executed 10,000 turns but failed its final old-belief retention check; that issue is corrected and covered by a new regression. **The corrected full 10,000-turn replay has not yet been rerun.** The included simulator and `npm run verify` support that complete check. The [test report](docs/TEST_REPORT.md) records current evidence, timing, state size and script fingerprints.
+This release passed **159/159 regression tests**, **25/25 targeted capture/recall probes** and the complete **10,000-turn replay**, with no recorded engine errors. After 30,356 hook calls, all six protected world facts and the protected automatic-learning fixture passed their final recall checks. The learned code remained available to its owner and was excluded from public recall and an unrelated NPC.
+
+The generated [test report](docs/TEST_REPORT.md) records the measured outcome, timing, state size and exact install-file fingerprints. Fixtures exercise direct NPC evidence, private/public duplicate boundaries, complete belief claims, legacy repair, mid-turn setting changes, belief withdrawal/undo, rotating-cast scheduling, quote boundaries, failed writes, Unicode byte limits, large bootstraps, repetitive recall, loss of current state, replay checkpoint integrity and trailing child-process output.
 
 ```bash
 npm run build
 npm test
+npm run benchmark
 npm run stress
 npm run verify
 ```
 
-Node.js 20+ is only needed for these development commands and optional tools. There are no npm package dependencies. GitHub Actions runs regression tests and a shorter 1,000-turn simulation on pushes and pull requests.
+Node.js 20+ is only needed for these development commands and optional tools. There are no npm package dependencies. GitHub Actions runs regression tests, targeted recall probes and a shorter 1,000-turn simulation on pushes and pull requests.
+
+The long verification uses 1,000-turn batches of the same continuous adventure. Each batch writes `verification-checkpoint.json`; rerunning `npm run verify` or `npm run stress` resumes a matching checkpoint, including completed results. If the runtime, fixtures, Node version or target length changes, use a new checkpoint or remove the old one deliberately to start again. The file is excluded from Git and release ZIPs.
 
 The tests execute the real install files with JSON round trips, documented card helpers and a two-second per-hook timeout. They do not certify Latitude's live sandbox, measure peak hosted heap usage or compare real narrative quality against Inner Self. Use the [live compatibility checklist](docs/COMPATIBILITY.md).
 
-Automatic state extraction and awareness checks are narrow, English-focused rules. Retrieval is lexical with a small synonym table and explicit graph expansion, not semantic embedding search. Model cooperation and knowledge boundaries cannot be guaranteed solely by script instructions. Recent visible edits are reconciled; unseen old edits need manual correction. The API cannot supply hidden past history, and finite state/context cannot promise perfect recall of everything.
+Automatic state extraction and awareness checks are narrow, English-focused rules. Retrieval is lexical with light inflection handling, synonyms and explicit graph expansion, not semantic embedding search. Larger capture is still selective: sentences shorter than 20 or longer than 480 characters, unfinished fragments and content beyond configured limits are excluded. Model cooperation and knowledge boundaries cannot be guaranteed solely by script instructions. Recent visible edits are reconciled; unseen old edits need manual correction. The API cannot supply hidden past history, and finite state/context cannot promise perfect recall of everything.
 
 Keep native AI Dungeon memory features when useful. Combining two complete script engines requires explicit hook integration. Each installed hook must end with its own single `modifier(text)` call.
 

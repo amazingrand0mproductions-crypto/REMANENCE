@@ -1,5 +1,5 @@
 /*
- * REMANENCE — Memory & Living Minds v2.0.0
+ * REMANENCE — Memory & Living Minds v2.1.0
  * Original implementation. MIT licensed; see LICENSE.
  * Paste this entire file into AI Dungeon's Library tab.
  * No network calls, dependencies, eval, or additional model API required.
@@ -7,7 +7,7 @@
 var Remanence = (function () {
   "use strict";
 
-  var VERSION = "2.0.0";
+  var VERSION = "2.1.1";
   var SCHEMA = 2;
   var ROOT = "remanenceV2";
   var CORE_KEY = "__remanence_settings_memory__";
@@ -16,6 +16,9 @@ var Remanence = (function () {
   var END = "[/REMANENCE_DATA]";
   var HARD_BYTES = 1000000;
   var searchCache = Object.create(null);
+  var viewCache = null;
+  var liveCache = null;
+  var identityCache = null;
   var ADMIN = "[REMANENCE CONTROL]";
   var CORE = {
     enabled: true,
@@ -36,7 +39,10 @@ var Remanence = (function () {
     autoFacts: true,
     autoThreads: true,
     maxThreads: 60,
-    sourceCards: true
+    sourceCards: true,
+    capturePerAction: 8,
+    captureChars: 12000,
+    diverseRecall: true
   };
   var MINDS = {
     enabled: true,
@@ -48,14 +54,16 @@ var Remanence = (function () {
     memoriesPerNpc: 14,
     profileChars: 1200,
     mindChars: 200,
-    scanCardsPerTurn: 24
+    scanCardsPerTurn: 24,
+    autoKnowledge: true,
+    autoBeliefs: true
   };
   var EXPLAIN_CORE = {
     enabled: "Master switch. false suspends automatic capture, recall and minds; slash commands still work.",
     autoMemory: "Capture selected complete story sentences as quoted evidence. Does not store every word or interpret attempted actions as completed outcomes.",
     playerName: "Exact player name, or blank for explicit name placeholders/multiplayer names. Never inferred from NPC dialogue. Set with /player Name.",
     maxMemories: "Maximum ledger records, including observations, protected facts, NPC knowledge and motivation updates. Range 100–1000. Low-salience unprotected records are evicted at capacity.",
-    maxArchiveChars: "Legacy setting name: maximum ACTIVE ledger text characters, excluding the separate episodic archive. Range 20000–250000. The whole engine has a one-million-character serialized-state guard.",
+    maxArchiveChars: "Legacy setting name: maximum ACTIVE ledger text characters, excluding the separate episodic archive. Range 20000–250000. The engine has a one-million-byte UTF-8 serialized-state guard, including compact search indexes.",
     maxPinned: "Maximum protected records. Range 10–120. /remember and /fact are protected by default. Further protected writes are refused at this limit.",
     memoryBudget: "Maximum added REMANENCE context characters, including guidance and any model update request. Range 600–8000. Characters are not tokens; more context can displace older story text.",
     budgetShare: "Maximum fraction of info.maxChars used by REMANENCE. Range 0.05–0.30. The existing memory prefix and recent story also constrain this budget.",
@@ -69,19 +77,24 @@ var Remanence = (function () {
     autoFacts: "Recognise a narrow set of unquoted, literal named-character state statements: address, occupation, location and life status. Keep exact evidence and source provenance. Manual keyed canon takes priority; conflicts remain inspectable.",
     autoThreads: "Track explicit named-character promises/sworn commitments as open story threads. Never creates twists or forces a payoff. Use /threads and /resolve to manage them.",
     maxThreads: "Maximum current open threads, range 5–100. Automatic discovery stops at the limit; resolved threads remain historical while retained.",
-    sourceCards: "Index short excerpts from authored location/item/faction/lore/world cards and explicit relationships in character cards. Notes tagged [PRIVATE] or [SECRET] exclude that card from this indexing. Existing cards are never rewritten."
+    sourceCards: "Index short excerpts from authored location/item/faction/lore/world cards and explicit relationships in character cards. Notes tagged [PRIVATE] or [SECRET] exclude that card from this indexing. Existing cards are never rewritten.",
+    capturePerAction: "Maximum general evidence sentences captured from each story action, range 3–16; default 8. Selection balances importance and different details. Explicit state/knowledge extraction is separate. More capture increases capacity pressure; it does not preserve every word.",
+    captureChars: "Maximum characters examined per action, range 4000–20000; default 12000. Up to 96 complete sentences are considered. Long or unfinished sentences remain excluded. A larger scan cannot retrieve hidden history.",
+    diverseRecall: "Reduce repetitive unprotected excerpts in the delivered packet and reserve room for different evidence. Exact query details, protected canon and private ownership keep priority. This is lexical diversity, not semantic understanding."
   };
   var EXPLAIN_MINDS = {
     enabled: "Enable NPC profiles, private knowledge and motivations. false keeps world memory running.",
     modelUpdates: "Ask the story model for a small hidden JSON footer during selected normal turns. Omission or invalid JSON never blocks gameplay. Consumes part of normal response length.",
-    updateEvery: "Minimum normal-output interval between footer requests. Range 1–12. Default 3 avoids asking an NPC to update every response.",
+    updateEvery: "Minimum normal-output interval between footer requests. Range 1–12. Above 1, every fourth interval may wait one extra output so rotating casts do not lock updates to one NPC. Default 3 avoids asking for an update every response.",
     autoDiscover: "Recognise repeatedly named speakers/actors using conservative full-name patterns. Character/NPC cards and /npc Name are more reliable. Capitalised scenery alone never qualifies.",
     maxNpcs: "Maximum tracked NPC profiles. Range 8–80. Existing NPCs are retained at capacity; new ones are refused and reported.",
     activeNpcLimit: "Maximum referenced NPC profiles recalled in a context packet. Range 1–4. Mention alone does not establish presence or knowledge.",
     memoriesPerNpc: "Upper bound on private knowledge candidates per NPC. Range 4–24. Delivery is currently capped at two knowledge excerpts per NPC and can be smaller when space is tight. This is not a retained-knowledge limit; global capacity still applies.",
     profileChars: "Maximum stored source-card profile characters per NPC. Range 300–1800. Complete clauses are preferred; authored cards themselves are never changed.",
     mindChars: "Maximum characters in each goal, feeling, intention or belief update. Range 80–280. Motivations and beliefs are fictional interpretations, never verified facts or forced actions.",
-    scanCardsPerTurn: "Source cards examined per context call. Range 8–64. Scan rotates through up to 5000 cards; first pass examines at least 64. /scan restarts the scan."
+    scanCardsPerTurn: "Source cards examined per context call. Range 8–64. Scan rotates through up to 5000 cards; first pass examines at least 64. /scan restarts the scan.",
+    autoKnowledge: "Capture complete, affirmative, unquoted sentences explicitly showing a registered NPC learning, seeing, hearing, reading or witnessing. No model footer is required. Requests, questions, reported speech, speculation and another character's knowledge never grant awareness. Awareness does not establish truth. false disables direct capture; recognised private learning remains excluded from public memory.",
+    autoBeliefs: "Capture named-NPC believes/thinks/suspects statements as private, potentially false beliefs. Exact explicit withdrawals clear matching active claims while retaining history. No model footer is required. false disables direct capture; recognised private belief statements remain excluded from public memory. Model belief updates must copy the whole claim."
   };
   var STOP_WORDS = {};
   ("a an the to of and or in on at for from with as by is are was were be been being " +
@@ -102,6 +115,22 @@ var Remanence = (function () {
     betrayed: "betrayal", betrays: "betrayal", betrayal: "betrayal",
     bought: "purchase", purchased: "purchase", stolen: "theft", stole: "theft"
   };
+  Object.assign(SYNONYMS, {
+    residence: "address", resides: "address", residing: "address", home: "address",
+    employment: "occupation", job: "occupation", profession: "occupation",
+    whereabouts: "location", situated: "location", located: "location",
+    combination: "code", password: "code", passcode: "code",
+    locked: "lock", locking: "lock", locks: "lock",
+    hidden: "hide", hiding: "hide", hid: "hide", concealed: "hide", conceals: "hide",
+    learned: "learn", learnt: "learn", learning: "learn", learns: "learn",
+    saw: "see", seen: "see", sees: "see", seeing: "see",
+    heard: "hear", hears: "hear", hearing: "hear",
+    gave: "give", given: "give", giving: "give", gives: "give",
+    took: "take", taken: "take", taking: "take", takes: "take",
+    left: "leave", leaving: "leave", leaves: "leave",
+    kept: "keep", keeping: "keep", keeps: "keep",
+    witnesses: "witness", witnessed: "witness", witnessing: "witness"
+  });
   var RELATIONS = ("parent child sibling grandparent grandchild aunt uncle niece nephew cousin " +
     "spouse fiancé partner ex-partner lover friend best-friend rival enemy colleague employer " +
     "employee mentor student teacher teammate leader subordinate ally acquaintance guardian ward").split(" ");
@@ -114,10 +143,23 @@ var Remanence = (function () {
   function own(o, k) { return !!o && Object.prototype.hasOwnProperty.call(o, k); }
   function copy(o) { var r = {}; Object.keys(o).forEach(function (k) { r[k] = o[k]; }); return r; }
   function str(x) { return typeof x === "string" ? x : ""; }
-  function norm(x) {
-    return str(x).replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
-      .replace(/[–—]/g, "-").replace(/\s+/g, " ").trim().toLowerCase();
+  function serializedBytes(value) {
+    var json = JSON.stringify(value), bytes = json.length;
+    if (!/[^\x00-\x7f]/.test(json)) return bytes;
+    for (var i = 0; i < json.length; i++) {
+      var code = json.charCodeAt(i);
+      if (code < 128) continue;
+      if (code < 2048) bytes++;
+      else if (code >= 55296 && code <= 56319 && i + 1 < json.length && json.charCodeAt(i + 1) >= 56320 && json.charCodeAt(i + 1) <= 57343) { bytes += 2; i++; }
+      else bytes += 2;
+    }
+    return bytes;
   }
+  function normalText(x) {
+    return str(x).replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
+      .replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
+  }
+  function norm(x) { return normalText(x).toLowerCase(); }
   function hash(x) {
     var h = 2166136261;
     x = str(x);
@@ -147,10 +189,23 @@ var Remanence = (function () {
     var out = [];
     var seen = {};
     for (var i = 0; i < list.length && out.length < 48; i++) {
-      var w = SYNONYMS[list[i]] || list[i];
+      var w = term(list[i]);
       if (w.length > 1 && !own(STOP_WORDS, w) && !own(seen, w)) { out.push(w); seen[w] = true; }
     }
     return out;
+  }
+  function term(w) {
+    if (own(SYNONYMS, w)) return SYNONYMS[w];
+    if (/\d/.test(w)) return w;
+    // Small English inflection rules; literal numbers and name resolution remain separate.
+    if (w.length > 5 && /ies$/.test(w)) return w.slice(0, -3) + "y";
+    if (w.length > 5 && /(?:ches|shes|xes|zes)$/.test(w)) return w.slice(0, -2);
+    if (w.length > 4 && /s$/.test(w) && !/(?:ss|us|is)$/.test(w)) return w.slice(0, -1);
+    if (w.length > 5 && /(?:ing|ed)$/.test(w)) {
+      var root = w.replace(/(?:ing|ed)$/, "");
+      return /([b-df-hj-np-tv-z])\1$/.test(root) ? root.slice(0, -1) : root;
+    }
+    return w;
   }
   function jsonData(s) {
     // Boundary-safe storage: all recalled prose is quoted JSON data, not a new instruction.
@@ -248,7 +303,20 @@ var Remanence = (function () {
     }
     if (!Array.isArray(d.archive)) d.archive = [];
     if (!Array.isArray(d.exclusions)) d.exclusions = [];
-    ["archived", "archiveEvicted", "suppressed"].forEach(function (key) { if (!Number.isFinite(d.stats[key])) d.stats[key] = 0; });
+    if (!d.core || typeof d.core !== "object" || Array.isArray(d.core) ||
+        !d.minds || typeof d.minds !== "object" || Array.isArray(d.minds) ||
+        !d.stats || typeof d.stats !== "object" || Array.isArray(d.stats)) {
+      throw new Error("Damaged REMANENCE configuration; preserved without resetting");
+    }
+    if (d.version !== VERSION) {
+      d.core = Object.assign(copy(CORE), d.core);
+      d.minds = Object.assign(copy(MINDS), d.minds);
+      d.events.forEach(function (e) { e.words = indexWords(e); });
+      d.archive.forEach(function (e) { e.lex = indexWords(e).join(" "); });
+      repairPrivateCopies(d);
+      d.migrateSettings = true;
+    }
+    ["archived", "archiveEvicted", "suppressed", "privacyRepaired"].forEach(function (key) { if (!Number.isFinite(d.stats[key])) d.stats[key] = 0; });
     if (!Array.isArray(d.stats.trace)) d.stats.trace = [];
     d.version = VERSION;
     if (!Array.isArray(d.seenActions)) d.seenActions = [];
@@ -332,6 +400,8 @@ var Remanence = (function () {
     c.maxEpisodes = clamp(integer(c.maxEpisodes, 800), 0, 1600);
     c.episodeChars = clamp(integer(c.episodeChars, 180000), 0, 350000);
     c.maxThreads = clamp(integer(c.maxThreads, 60), 5, 100);
+    c.capturePerAction = clamp(integer(c.capturePerAction, 8), 3, 16);
+    c.captureChars = clamp(integer(c.captureChars, 12000), 4000, 20000);
   }
   function configure(d) {
     var a = addConfig(CORE_KEY, "REMANENCE — Memory", CORE, d.core, configNotes(CORE, EXPLAIN_CORE, "Memory"));
@@ -372,6 +442,8 @@ var Remanence = (function () {
     return found;
   }
   function aliasMap(d) {
+    var players = playerNames(d).join("|");
+    if (identityCache && identityCache.npcs === d.npcs && identityCache.count === d.npcs.length && identityCache.players === players) return identityCache.map;
     var map = Object.create(null);
     function add(alias, id) {
       alias = norm(alias);
@@ -387,6 +459,7 @@ var Remanence = (function () {
     playerNames(d).forEach(function (name) {
       add(name, "PLAYER"); add(name.split(/\s+/)[0], "PLAYER");
     });
+    identityCache = { npcs: d.npcs, count: d.npcs.length, players: players, map: map };
     return map;
   }
   function npcById(d, id) { return d.npcs.find(function (n) { return n.id === id; }) || null; }
@@ -402,6 +475,7 @@ var Remanence = (function () {
     });
   }
   function addNpc(d, name, aliases, profile, source) {
+    identityCache = null;
     name = validName(name);
     if (!name || isPlayer(d, name)) return null;
     var n = d.npcs.find(function (x) { return norm(x.name) === norm(name); });
@@ -477,12 +551,25 @@ var Remanence = (function () {
       if (c.anchors.length >= 2) addNpc(d, name, [], "", "discovered");
     }
   }
-  function sentences(s) {
+  function sentences(s, maxChars, maxSentences, unquotedOnly) {
     // Preserve decimals, initials and common abbreviations; never promote a trailing fragment.
-    var textValue = str(s).slice(0, 4000), list = [], start = 0;
-    for (var i = 0; i < textValue.length && list.length < 24; i++) {
+    var textValue = str(s).slice(0, maxChars || 12000), list = [], start = 0, quote = "", hadQuote = false;
+    function quoteMark(ch, pos) {
+      if (/['‘’]/.test(ch) && /[a-z0-9]/i.test(textValue.charAt(pos - 1)) && /[a-z0-9]/i.test(textValue.charAt(pos + 1))) return "";
+      return /["“”]/.test(ch) ? '"' : /['‘’]/.test(ch) ? "'" : "";
+    }
+    function trackQuote(ch, pos) {
+      var mark = quoteMark(ch, pos);
+      if (!mark) return;
+      hadQuote = true;
+      if (!quote) quote = mark;
+      else if (quote === mark) quote = "";
+    }
+    for (var i = 0; i < textValue.length && list.length < (maxSentences || 96); i++) {
       var ch = textValue.charAt(i);
-      if (ch === "\n") { if (textValue.slice(start, i).trim()) start = i + 1; continue; }
+      if (quote) hadQuote = true;
+      trackQuote(ch, i);
+      if (ch === "\n") { if (textValue.slice(start, i).trim()) { start = i + 1; hadQuote = !!quote; } continue; }
       if (!/[.!?]/.test(ch)) continue;
       if (ch === ".") {
         if (/\d/.test(textValue.charAt(i - 1)) && /\d/.test(textValue.charAt(i + 1))) continue;
@@ -490,10 +577,11 @@ var Remanence = (function () {
         if (word && /^(?:Mr|Mrs|Ms|Miss|Dr|Prof|St|No|Jr|Sr|vs|e|g|i)$/i.test(word[1]) && /\S/.test(textValue.slice(i + 1))) continue;
         if (word && /^[A-Z]$/.test(word[1]) && /^\s+[A-Z]/.test(textValue.slice(i + 1))) continue;
       }
-      while (/[.!?"'”’]/.test(textValue.charAt(i + 1)) && i + 1 < textValue.length) i++;
+      while (/[.!?"'”’]/.test(textValue.charAt(i + 1)) && i + 1 < textValue.length) { i++; trackQuote(textValue.charAt(i), i); }
       var part = textValue.slice(start, i + 1).trim().replace(/^>\s*/, "");
-      if (part.length >= 20 && part.length <= 480 && part.indexOf(ADMIN) < 0) list.push(part);
+      if (part.length >= 20 && part.length <= 480 && part.indexOf(ADMIN) < 0 && (!unquotedOnly || !hadQuote)) list.push(part);
       start = i + 1;
+      hadQuote = !!quote;
     }
     return list;
   }
@@ -505,13 +593,127 @@ var Remanence = (function () {
     if (/\b(lives|address|birthday|allergic|allergy|named|works|owns|lost|gave|bought|found|stole)\b|\d{2,}/i.test(s)) score += 2;
     return Math.min(10, score);
   }
-  function allEvents(d) { return d.events.concat(d.archive || []); }
+  function invalidateViews() { viewCache = null; liveCache = null; }
+  function allEvents(d) {
+    if (!viewCache || viewCache.events !== d.events || viewCache.archive !== d.archive ||
+        viewCache.eventCount !== d.events.length || viewCache.archiveCount !== d.archive.length) {
+      viewCache = { events: d.events, archive: d.archive, eventCount: d.events.length,
+        archiveCount: d.archive.length, records: d.events.concat(d.archive || []) };
+      liveCache = null;
+    }
+    return viewCache.records;
+  }
   function recordKey(e) { return [e.kind || "observation", e.owner || "", e.slot || "", norm(e.text)].join("|"); }
-  function isPrivate(e) { return PRIVATE_KINDS.indexOf(e.kind) >= 0 || e.visibility === "private"; }
+  function isPrivate(e) { return !!e.owner || PRIVATE_KINDS.indexOf(e.kind) >= 0 || e.visibility === "private"; }
   function suppressionKey(e) { return hash((isPrivate(e) ? str(e.owner) + "|" : "") + norm(e.text)); }
   function searchWords(e) {
-    if (!own(searchCache, e.id)) searchCache[e.id] = tokens(e.text + " " + str(e.subject) + " " + str(e.attribute) + " " + (e.tags || []).join(" "));
+    if (!own(searchCache, e.id)) searchCache[e.id] = Array.isArray(e.words) ? e.words : typeof e.lex === "string" ? e.lex.split(" ").filter(Boolean) : indexWords(e);
     return searchCache[e.id];
+  }
+  function indexWords(e) {
+    return tokens(e.text + " " + str(e.subject) + " " + str(e.attribute) + " " + (e.tags || []).join(" "));
+  }
+  function asserted(s, mental) {
+    if (/[?"“”]|\b(?:if|might|may|maybe|perhaps|apparently|rumou?r|alleged|dreams?|dreamed|imagines?|imagined|pretend|would|could)\b/i.test(s)) return false;
+    return mental || !/\b(?:not|never|didn't|doesn't|wasn't|isn't|hasn't|hadn't)\b/i.test(s);
+  }
+  function subjectTail(d, n, s, preserveCase) {
+    if (!asserted(s, true)) return "";
+    var value = norm(s), names = evidenceNames(d, n);
+    for (var i = 0; i < names.length; i++) {
+      var name = norm(names[i]);
+      if (value.indexOf(name + " ") === 0 || value.indexOf(name + ",") === 0) return (preserveCase ? normalText(s) : value).slice(name.length).replace(/^\s*,?\s*/, "");
+    }
+    return "";
+  }
+  function subjectNpc(d, s) {
+    var map = aliasMap(d), head = norm(s).slice(0, 82), found = "", length = 0;
+    Object.keys(map).forEach(function (name) {
+      if (map[name] && map[name] !== "PLAYER" && name.length > length &&
+          (head.indexOf(name + " ") === 0 || head.indexOf(name + ",") === 0)) {
+        found = map[name]; length = name.length;
+      }
+    });
+    return found ? npcById(d, found) : null;
+  }
+  function claimText(s) { return norm(s).replace(/^that\s+/, "").replace(/[.!]$/, ""); }
+  function mentalStatement(d, sentence) {
+    var n = subjectNpc(d, sentence);
+    if (!n || isPlayer(d, n.name)) return null;
+    var tail = subjectTail(d, n, sentence, true), match;
+    if (explicitKnowledge(d, n, sentence)) return { n: n, kind: "knowledge", claim: sentence, withdrawn: false };
+    if ((match = tail.match(/^(?:believes|believed|suspects|suspected|thinks|thought|assumes|assumed)\s+(.+?)[.!]$/i))) {
+      return { n: n, kind: "belief", claim: match[1], withdrawn: false };
+    }
+    if ((match = tail.match(/^(?:no longer (?:believes|suspects|thinks|assumes)|(?:does not|doesn't|did not|didn't) (?:believe|suspect|think|assume)|(?:stops|stopped) (?:believing|suspecting|thinking|assuming))\s+(.+?)[.!]$/i))) {
+      return { n: n, kind: "belief", claim: match[1], withdrawn: true };
+    }
+    return null;
+  }
+  function repairPrivateCopies(d) {
+    // Repair only automatic public copies with a matching, already-grounded private source.
+    // Authored public canon and imports remain explicit author decisions.
+    var records = allEvents(d), scoped = Object.create(null), drop = Object.create(null), repaired = 0;
+    records.forEach(function (e) {
+      if (!e.owner || e.manual || (e.kind !== "knowledge" && e.kind !== "belief")) return;
+      var withdrawn = e.beliefStatus === "withdrawn";
+      var value = e.kind === "knowledge" ? norm(e.text) : claimText(withdrawn ? e.text.replace(/^No longer believes:\s*/i, "") : e.text);
+      var key = [e.kind, e.owner, withdrawn ? 1 : 0, value].join("|");
+      if (!own(scoped, key)) scoped[key] = [];
+      scoped[key].push(e);
+    });
+    records.forEach(function (e) {
+      if (e.manual || e.owner || e.kind !== "observation") return;
+      var mental = mentalStatement(d, e.text);
+      if (!mental) return;
+      var value = mental.kind === "knowledge" ? norm(e.text) : claimText(mental.claim);
+      var matches = scoped[[mental.kind, mental.n.id, mental.withdrawn ? 1 : 0, value].join("|")] || [];
+      var reference = matches.find(function (candidate) {
+        return e.sources.some(function (a) {
+          return candidate.sources.some(function (b) { return a.anchor === b.anchor && str(a.card) === str(b.card); });
+        });
+      });
+      if (!reference) return;
+      repaired++;
+      if (!e.pinned) { drop[e.id] = true; return; }
+      // Keep a protected copy's ID and protection, while restoring its supported owner/type.
+      e.kind = reference.kind; e.owner = reference.owner; e.visibility = "private";
+      e.text = reference.text; e.slot = reference.slot; e.entities = reference.entities.slice();
+      e.sources = reference.sources.map(copy); e.order = reference.order;
+      if (reference.beliefStatus === "withdrawn") e.beliefStatus = "withdrawn";
+      else delete e.beliefStatus;
+      e.key = recordKey(e); e.words = indexWords(e); delete e.lex;
+      if (!reference.pinned) drop[reference.id] = true;
+    });
+    if (repaired) {
+      d.events = d.events.filter(function (e) { return !own(drop, e.id); });
+      d.archive = d.archive.filter(function (e) { return !own(drop, e.id); });
+      d.stats.privacyRepaired = integer(d.stats.privacyRepaired, 0) + repaired;
+      d.backupCache = null; invalidateViews();
+    }
+  }
+  function overlap(a, b, bag) {
+    var count = 0;
+    a.forEach(function (w) { if (bag ? own(bag, w) : b.indexOf(w) >= 0) count++; });
+    return count / Math.max(1, Math.min(a.length, b.length));
+  }
+  function wordBag(words) {
+    var bag = Object.create(null); words.forEach(function (w) { bag[w] = true; }); return bag;
+  }
+  function captureSelection(d, list, cap) {
+    var remaining = list.map(function (item) { return { item: item, similarity: 0 }; }), selected = [];
+    while (remaining.length && selected.length < cap) {
+      var best = 0, bestScore = -Infinity;
+      remaining.forEach(function (candidate, i) {
+        var item = candidate.item;
+        var score = item.score - candidate.similarity * 2 + Math.min(0.6, item.words.length / 30);
+        if (score > bestScore) { best = i; bestScore = score; }
+      });
+      var chosen = remaining.splice(best, 1)[0].item, bag = wordBag(chosen.words);
+      selected.push(chosen);
+      remaining.forEach(function (candidate) { candidate.similarity = Math.max(candidate.similarity, overlap(candidate.item.words, chosen.words, bag)); });
+    }
+    return selected.sort(function (a, b) { return a.index - b.index; });
   }
   function cardKey(c) { return c.id === undefined ? "keys:" + hash(str(c.keys)) : String(c.id); }
   function cardSignature(c) { return hash(cardText(c) + "|" + str(c.keys) + "|" + str(c.type) + "|" + cardNotes(c)); }
@@ -580,13 +782,41 @@ var Remanence = (function () {
   }
   function openThreads(d) { return liveEvents(d).filter(function (e) { return e.kind === "thread" && e.threadStatus !== "resolved"; }); }
   function learnStructured(d, clean, source) {
-    var known = d.npcs.map(function (n) { return n.name; }).concat(playerNames(d));
-    sentences(clean).slice(0, 16).forEach(function (sentence) {
+    var known = d.npcs.map(function (n) { return n.name; }).concat(playerNames(d)).map(function (name) { return { name: name, key: norm(name) }; });
+    var scoped = Object.create(null);
+    sentences(clean, d.core.captureChars, 96, true).forEach(function (sentence, index) {
+      var mental = mentalStatement(d, sentence);
+      if (mental) scoped[norm(sentence)] = true;
+      if (index >= 64) return;
       // Quotes, conditional/modal statements, denials and speculation must remain raw evidence.
-      if (/["“”]|\b(?:if|might|may|maybe|perhaps|apparently|rumou?r|alleged|dream|pretend|would|could|not|never)\b/i.test(sentence)) return;
-      var subject = known.find(function (name) { return norm(sentence).indexOf(norm(name) + " ") === 0; });
+      var n = d.minds.enabled && mental ? mental.n : null;
+      if (n && !isPlayer(d, n.name)) {
+        if (d.minds.autoKnowledge && mental.kind === "knowledge") record(d, {
+          kind: "knowledge", text: sentence, owner: n.id, entities: [n.id], visibility: "private",
+          importance: 7, origin: "story:explicit-awareness"
+        }, source);
+        if (d.minds.autoBeliefs && mental.kind === "belief" && !mental.withdrawn && mental.claim.length <= d.minds.mindChars) record(d, {
+          kind: "belief", text: mental.claim, owner: n.id, entities: [n.id], visibility: "private",
+          slot: "claim:" + hash(norm(mental.claim)), importance: 6, origin: "story:explicit-belief"
+        }, source);
+        if (d.minds.autoBeliefs && mental.kind === "belief" && mental.withdrawn) {
+          var claim = claimText(mental.claim);
+          liveEvents(d).filter(function (e) {
+            return e.kind === "belief" && e.slot && e.owner === n.id && e.beliefStatus !== "withdrawn" &&
+              claimText(e.text) === claim;
+          }).slice(0, 8).forEach(function (old) {
+            record(d, { kind: "belief", text: "No longer believes: " + old.text, owner: n.id,
+              entities: [n.id], visibility: "private", slot: old.slot || "claim:" + hash(norm(old.text)),
+              beliefStatus: "withdrawn", importance: 6, origin: "story:belief-withdrawal" }, source);
+          });
+        }
+      }
+      if (!asserted(sentence)) return;
+      var sentenceNorm = norm(sentence);
+      var named = known.find(function (item) { return sentenceNorm.indexOf(item.key + " ") === 0; });
+      var subject = named ? named.name : "";
       if (subject && d.core.autoFacts) {
-        var tail = sentence.slice(subject.length).trim(), match, attribute = "", value = "";
+        var tail = normalText(sentence).slice(subject.length).trim(), match, attribute = "", value = "";
         if ((match = tail.match(/^(?:now )?(?:lives|resides) at (.{2,140})[.!]$/i))) { attribute = "address"; value = match[1]; }
         else if ((match = tail.match(/^(?:now )?works as (?:a |an )?(.{2,100})[.!]$/i))) { attribute = "occupation"; value = match[1]; }
         else if ((match = tail.match(/^(?:is now at|arrives at|arrived at|enters|entered) (.{2,100})[.!]$/i)) && !/^(?:a |an )?(?:conclusion|agreement|understanding|state|dream|thought)\b/i.test(match[1])) { attribute = "location"; value = match[1]; }
@@ -602,6 +832,7 @@ var Remanence = (function () {
           subject: subject, entities: mentions(d, sentence), importance: 9, origin: "story:explicit-commitment" }, source);
       }
     });
+    return scoped;
   }
   function linkedNames(d, query) {
     var links = Object.create(null);
@@ -635,6 +866,7 @@ var Remanence = (function () {
   function record(d, fields, source) {
     var textValue = str(fields.text).trim();
     if (!textValue || textValue.length > 700) return null;
+    invalidateViews();
     var key = [fields.kind || "observation", fields.owner || "", fields.slot || "", norm(textValue)].join("|");
     if (!fields.manual && d.exclusions.indexOf(suppressionKey(fields)) >= 0) { d.stats.suppressed++; return null; }
     if (!fields.manual && (fields.kind || "observation") === "observation") {
@@ -643,10 +875,16 @@ var Remanence = (function () {
       });
       if (typed) return typed;
     }
-    var e = !fields.manual ? d.events.find(function (x) { return !x.manual && x.key === key; }) : null;
-    if (!e && !fields.manual) {
-      e = d.archive.find(function (x) { return !x.manual && recordKey(x) === key; });
-      if (e) { d.archive = d.archive.filter(function (x) { return x.id !== e.id; }); e.key = key; e.words = tokens(e.text); d.events.push(e); }
+    var e = fields.manual && !fields.slot ? d.events.find(function (x) { return x.manual && x.key === key; }) :
+      !fields.manual ? d.events.find(function (x) { return !x.manual && x.key === key; }) : null;
+    if (!e && (!fields.manual || !fields.slot)) {
+      e = d.archive.find(function (x) { return x.manual === !!fields.manual && recordKey(x) === key; });
+      if (e) { d.archive = d.archive.filter(function (x) { return x.id !== e.id; }); e.key = key; e.words = indexWords(e); delete e.lex; d.events.push(e); }
+    }
+    if (fields.manual && e) {
+      if (fields.pinned) e.pinned = true;
+      e.importance = Math.max(e.importance, integer(fields.importance, e.importance));
+      if (fields.origin === "player:canon") e.origin = fields.origin;
     }
     if (!e) {
       e = { id: "m" + (d.nextId++), key: key, kind: fields.kind || "observation", text: textValue,
@@ -654,11 +892,13 @@ var Remanence = (function () {
         importance: clamp(integer(fields.importance, salience(textValue)), 1, 10),
         pinned: fields.pinned === true, manual: fields.manual === true,
         visibility: fields.visibility || "narrator", origin: fields.origin || "story", sources: [],
-        created: frame(), touched: frame(), order: frame(), words: tokens(textValue),
+        created: frame(), touched: frame(), order: frame(), words: [],
         subject: str(fields.subject), attribute: str(fields.attribute), value: str(fields.value),
         edge: Array.isArray(fields.edge) ? fields.edge.slice(0, 2) : [], relation: str(fields.relation),
         threadStatus: str(fields.threadStatus), tags: Array.isArray(fields.tags) ? fields.tags.slice(0, 24) : [] };
       d.events.push(e);
+      if (e.kind === "belief" && fields.beliefStatus === "withdrawn") e.beliefStatus = "withdrawn";
+      e.words = indexWords(e);
       d.stats.captured++;
     }
     if (source && !e.sources.some(function (s) { return s.seq === source.seq && s.anchor === source.anchor && str(s.card) === str(source.card); })) {
@@ -667,6 +907,10 @@ var Remanence = (function () {
     }
     e.touched = frame();
     if (source && !source.card) e.order = Math.max(integer(e.order, e.created), source.seq === null ? source.frame : source.seq);
+    var authority = fields.manual ? 2 : source && source.card ? 0 : 1;
+    if (e.historicalOnly && authority >= e.retiredAuthority && e.order > e.retiredAt) {
+      delete e.historicalOnly; delete e.retiredAt; delete e.retiredAuthority; delete e.retiredSources;
+    }
     return e;
   }
   function learnAction(d, value, type, source) {
@@ -675,17 +919,20 @@ var Remanence = (function () {
     detectNames(d, clean, source.anchor);
     if (!d.core.autoMemory) return;
     var isIntent = /^(do|say)$/i.test(type);
-    if (!isIntent) learnStructured(d, clean, source);
-    var list = sentences(clean).map(function (s, i) { return { text: s, score: salience(s), index: i }; });
-    list.sort(function (a, b) { return b.score - a.score || a.index - b.index; });
-    var cap = isIntent ? 1 : 3;
-    list.slice(0, cap).forEach(function (item) {
+    var scoped = isIntent ? Object.create(null) : learnStructured(d, clean, source);
+    var list = sentences(clean, d.core.captureChars).filter(function (sentence) {
+      // Scope is independent of capture success, capacity, suppression and auto-capture switches.
+      return !own(scoped, norm(sentence));
+    }).map(function (s, i) { return { text: s, score: salience(s), index: i, words: tokens(s) }; });
+    var cap = isIntent ? 1 : d.core.capturePerAction;
+    captureSelection(d, list, cap).forEach(function (item) {
       if (isIntent && item.score < 4) return;
       record(d, { text: item.text, kind: isIntent ? "intent" : "observation", entities: mentions(d, item.text),
         importance: item.score, origin: "history:" + type, visibility: "narrator" }, source);
     });
   }
   function reconcile(d) {
+    invalidateViews();
     var h = actions(), count = d.warmed ? d.core.scanActions : d.core.bootstrapActions;
     var first = Math.max(0, h.length - count), base = frame() - h.length;
     var signatures = Object.create(null), anchorToSeq = Object.create(null);
@@ -698,7 +945,7 @@ var Remanence = (function () {
     var cardSources = cardSourceMap(), cardHashes = Object.create(null);
     function reconcileRecords(records) { return records.filter(function (e) {
       if (e.manual) return true;
-      e.sources = e.sources.filter(function (s) {
+      function retainedSource(s) {
         if (s.card) {
           if (!own(cardSources, s.card) || /\[(?:PRIVATE|SECRET)\]/i.test(cardNotes(cardSources[s.card]))) return false;
           if (!own(cardHashes, s.card)) cardHashes[s.card] = cardSignature(cardSources[s.card]);
@@ -712,7 +959,14 @@ var Remanence = (function () {
         if (s.seq >= end) return false;
         if (s.seq >= start) return own(signatures, s.seq) && signatures[s.seq] === s.anchor;
         return true;
-      });
+      }
+      e.sources = e.sources.filter(retainedSource);
+      if (e.historicalOnly && Array.isArray(e.retiredSources) && e.retiredSources.length) {
+        e.retiredSources = e.retiredSources.filter(retainedSource);
+        if (!e.retiredSources.length) {
+          delete e.historicalOnly; delete e.retiredAt; delete e.retiredAuthority; delete e.retiredSources;
+        }
+      }
       if (!e.sources.length) { removed++; return false; }
       if (!e.manual) e.order = e.sources.reduce(function (v, s) { return Math.max(v, s.seq === null ? s.frame : s.seq); }, 0);
       return true;
@@ -750,9 +1004,11 @@ var Remanence = (function () {
     });
   }
   function liveEvents(d) {
-    var latest = Object.create(null);
     var records = allEvents(d);
+    if (liveCache) return liveCache;
+    var latest = Object.create(null);
     records.forEach(function (e) {
+      if (e.historicalOnly) return;
       if (e.slot && /^(fact|relation|mind|belief|thread)$/.test(e.kind)) {
         var key = e.kind + "|" + e.owner + "|" + e.slot;
         var old = latest[key];
@@ -767,17 +1023,18 @@ var Remanence = (function () {
     records.forEach(function (e) {
       if (/^(fact|relation)$/.test(e.kind) && e.slot && latest[e.kind + "|" + e.owner + "|" + e.slot] !== e) oldStateTexts[norm(e.text)] = true;
     });
-    return records.filter(function (e) {
+    liveCache = records.filter(function (e) {
       if (e.kind === "observation" && own(oldStateTexts, norm(e.text))) return false;
-      return !e.slot || !/^(fact|relation|mind|belief|thread)$/.test(e.kind) || latest[e.kind + "|" + e.owner + "|" + e.slot] === e;
+      return !e.historicalOnly && (!e.slot || !/^(fact|relation|mind|belief|thread)$/.test(e.kind) || latest[e.kind + "|" + e.owner + "|" + e.slot] === e);
     });
+    return liveCache;
   }
   function rank(d, query, includePrivate, strict) {
     var q = tokens(query), querySet = Object.create(null), df = Object.create(null);
     var queryNorm = norm(query), phraseQuery = queryNorm.length >= 3 && queryNorm.length <= 80 ? queryNorm : "";
     q.forEach(function (w) { querySet[w] = true; });
     var list = liveEvents(d).filter(function (e) {
-      return (includePrivate || !isPrivate(e)) && (d.core.sourceCards || str(e.origin).indexOf("card:") !== 0);
+      return e.beliefStatus !== "withdrawn" && (includePrivate || !isPrivate(e)) && (d.core.sourceCards || str(e.origin).indexOf("card:") !== 0);
     });
     var avg = 0;
     list.forEach(function (e) { var words = searchWords(e); avg += words.length; words.forEach(function (w) { if (own(querySet, w)) df[w] = (df[w] || 0) + 1; }); });
@@ -797,14 +1054,48 @@ var Remanence = (function () {
       var phrase = phraseQuery && norm(e.text).indexOf(phraseQuery) >= 0 ? 2 : 0;
       var age = Math.max(0, frame() - e.touched);
       var score = lexical * 3 + entity + association + phrase + e.importance * 0.25 + 1 / (1 + age / 20) + (e.pinned ? 5 : 0);
+      if (matched.some(function (w) { return /\d/.test(w); })) score += 8;
       return { e: e, score: score, match: lexical > 0 || entity > 0 || association > 0,
         terms: matched, distance: distance <= 2 ? distance : null, archived: !e.words };
     }).filter(function (r) { return !strict || r.match; })
       .sort(function (a, b) { return b.score - a.score || a.e.id.localeCompare(b.e.id); });
   }
+  function diverseRows(d, ranked, limit) {
+    if (!d.core.diverseRecall) return ranked.slice(0, limit);
+    var remaining = ranked.slice(0, 64).map(function (row) { return { row: row, similarity: 0 }; }), selected = [];
+    while (remaining.length && selected.length < limit) {
+      var best = 0, bestValue = -Infinity;
+      remaining.forEach(function (candidate, i) {
+        var row = candidate.row, value = row.score * (1 - candidate.similarity * 0.65);
+        if (row.e.kind === "fact" || row.e.kind === "relation") value += 2;
+        if (value > bestValue) { best = i; bestValue = value; }
+      });
+      var chosen = remaining.splice(best, 1)[0].row, words = searchWords(chosen.e), bag = wordBag(words);
+      selected.push(chosen);
+      remaining.forEach(function (candidate) { candidate.similarity = Math.max(candidate.similarity, overlap(searchWords(candidate.row.e), words, bag)); });
+    }
+    return selected;
+  }
   function ledgerChars(d) { return d.events.reduce(function (n, e) { return n + e.text.length; }, 0); }
   function pinnedCount(d) { return d.events.filter(function (e) { return e.pinned; }).length; }
+  function retireMissingVersions(d, current) {
+    invalidateViews();
+    var records = allEvents(d), ids = Object.create(null), missing = Object.create(null);
+    records.forEach(function (e) { ids[e.id] = true; });
+    current.forEach(function (e) {
+      if (e.slot && /^(fact|relation|mind|belief|thread)$/.test(e.kind) && !own(ids, e.id)) missing[e.kind + "|" + e.owner + "|" + e.slot] = e;
+    });
+    records.forEach(function (e) {
+      var head = missing[e.kind + "|" + e.owner + "|" + e.slot];
+      if (!head) return;
+      e.historicalOnly = true; e.retiredAt = head.order;
+      e.retiredAuthority = /^(fact|relation|thread)$/.test(head.kind) ? (head.manual ? 2 : str(head.origin).indexOf("card:") === 0 ? 0 : 1) : 0;
+      e.retiredSources = head.sources.map(copy);
+    });
+    invalidateViews();
+  }
   function prune(d) {
+    invalidateViews();
     var chars = ledgerChars(d);
     var current = liveEvents(d), liveIds = Object.create(null);
     current.forEach(function (e) { liveIds[e.id] = true; });
@@ -813,6 +1104,8 @@ var Remanence = (function () {
     candidates.forEach(function (e) {
       var isCurrent = own(liveIds, e.id);
       retention[e.id] = e.importance + (isCurrent ? 3 : -12) + (e.kind === "knowledge" ? 2 : 0) +
+        (e.kind === "knowledge" && e.origin === "player:npc-knowledge" ? 8 : 0) +
+        (/^(fact|relation)$/.test(e.kind) && isCurrent ? 12 : 0) +
         (e.kind === "mind" && isCurrent ? 20 : 0) + (e.kind === "belief" && isCurrent ? 12 : 0) +
         (e.kind === "thread" && e.threadStatus !== "resolved" && isCurrent ? 15 : 0) +
         2 / (1 + Math.max(0, now - e.touched) / 40);
@@ -827,7 +1120,7 @@ var Remanence = (function () {
     d.events = d.events.filter(function (e) {
       if (!own(evict, e.id)) return true;
       if (d.core.episodicArchive && e.kind !== "intent" && e.kind !== "mind" && e.importance >= 4) {
-        var compact = copy(e); delete compact.words; delete compact.key;
+        var compact = copy(e); compact.lex = searchWords(e).join(" "); delete compact.words; delete compact.key;
         ["subject", "attribute", "value", "relation", "threadStatus"].forEach(function (k) { if (!compact[k]) delete compact[k]; });
         ["tags", "edge"].forEach(function (k) { if (!compact[k] || !compact[k].length) delete compact[k]; });
         d.archive.push(compact); d.stats.archived++;
@@ -845,23 +1138,33 @@ var Remanence = (function () {
       d.archive = d.archive.filter(function (e) { return !own(archiveDrop, e.id); });
       d.stats.archiveEvicted += Object.keys(archiveDrop).length;
     }
+    retireMissingVersions(d, current);
     d.backupCache = null;
-    var bytes = JSON.stringify(d).length;
+    var bytes = serializedBytes(d);
     if (bytes > HARD_BYTES) {
       // Batch removals rather than serializing a megabyte after each discarded record.
       var count = 0;
       while (count < d.archive.length && bytes > HARD_BYTES - 1000) {
-        bytes -= JSON.stringify(d.archive[count++]).length + 1;
+        bytes -= serializedBytes(d.archive[count++]) + 1;
       }
       if (count) { d.archive = d.archive.slice(count); d.stats.archiveEvicted += count; }
       var hardDrop = Object.create(null);
       for (var k = 0; k < candidates.length && bytes > HARD_BYTES - 1000; k++) {
         if (!d.events.some(function (e) { return e.id === candidates[k].id; })) continue;
-        hardDrop[candidates[k].id] = true; bytes -= JSON.stringify(candidates[k]).length + 1;
+        hardDrop[candidates[k].id] = true; bytes -= serializedBytes(candidates[k]) + 1;
       }
       d.events = d.events.filter(function (e) { return !own(hardDrop, e.id); }); d.stats.evicted += Object.keys(hardDrop).length;
-      if (JSON.stringify(d).length > HARD_BYTES) throw new Error("Protected memory or non-ledger data exceeds hard storage budget");
+      retireMissingVersions(d, current);
+      var finalBytes = serializedBytes(d), retiredDrop = Object.create(null);
+      allEvents(d).filter(function (e) { return e.historicalOnly && !e.pinned; }).forEach(function (e) {
+        if (finalBytes <= HARD_BYTES - 1000) return;
+        retiredDrop[e.id] = true; finalBytes -= serializedBytes(e) + 1;
+      });
+      d.events = d.events.filter(function (e) { return !own(retiredDrop, e.id); });
+      d.archive = d.archive.filter(function (e) { return !own(retiredDrop, e.id); });
+      if (serializedBytes(d) > HARD_BYTES) throw new Error("Protected memory or non-ledger data exceeds hard storage budget");
     }
+    invalidateViews();
   }
   function recentText() {
     return actions().slice(-2).map(function (a) {
@@ -873,22 +1176,12 @@ var Remanence = (function () {
     return list.filter(function (s) { return map[norm(s)] === n.id; });
   }
   function directActor(d, n, s) {
-    var value = norm(s);
-    return evidenceNames(d, n).some(function (name) {
-      var pos = value.indexOf(norm(name));
-      if (pos < 0 || !hasName(s, name)) return false;
-      var tail = value.slice(pos + norm(name).length, pos + norm(name).length + 90);
-      return /^\s*(?:,\s*)?(?:says|said|asks|asked|replies|replied|watches|watched|sees|saw|hears|heard|looks|looked|opens|opened|takes|took|walks|walked|stands|stood|sits|sat|arrives|arrived|knows|knew|learns|learned|discovers|discovered|remembers|remembered|whispers|whispered|reads|read)\b/.test(tail);
+    return sentences(s, 4000, 96, true).some(function (sentence) {
+      return /^(?:says|said|asks|asked|replies|replied|watches|watched|sees|saw|hears|heard|looks|looked|opens|opened|takes|took|walks|walked|stands|stood|sits|sat|arrives|arrived|knows|knew|learns|learned|discovers|discovered|remembers|remembered|whispers|whispered|reads|read)\b/.test(subjectTail(d, n, sentence));
     });
   }
   function explicitKnowledge(d, n, evidence) {
-    var value = norm(evidence);
-    return evidenceNames(d, n).some(function (name) {
-      var pos = value.indexOf(norm(name));
-      if (pos < 0 || !hasName(evidence, name)) return false;
-      var tail = value.slice(pos + norm(name).length);
-      return /^\s*(?:,\s*)?(?:knows|knew|learns|learned|discovers|discovered|sees|saw|hears|heard|reads|read|witnesses|witnessed|is told|was told)\b/.test(tail);
-    });
+    return /^(?:knows|knew|learns|learned|learnt|discovers|discovered|sees|saw|hears|heard|reads|read|witnesses|witnessed|is told|was told)\b/.test(subjectTail(d, n, evidence));
   }
   function activeNpcs(d, query) {
     if (!d.minds.enabled) return [];
@@ -921,21 +1214,32 @@ var Remanence = (function () {
     selectedThreads.forEach(function (r) {
       if (addLine(lines, "OPEN COMMITMENT " + r.e.slot + "=" + jsonData(r.e.text) + "; no forced payoff.", Math.floor(lineCap * 0.65))) recalled.push(r.e.id);
     });
-    var npcAllowance = Math.max(0, Math.floor((lineCap - lines.join("\n").length) * 0.68 / Math.max(1, referenced.length)));
+    var npcAllowance = Math.max(0, Math.floor((lineCap - lines.join("\n").length) * 0.78 / Math.max(1, referenced.length)));
     referenced.forEach(function (n) {
       var npcCap = Math.min(lineCap, lines.join("\n").length + npcAllowance);
-      addLine(lines, "NPC " + jsonData(n.name) + " ANCHOR=" + jsonData(cutClause(n.profile, Math.min(300, d.minds.profileChars))), npcCap);
-      var knows = privateRanked.map(function (r) { return r.e; }).filter(function (e) { return e.owner === n.id && e.kind === "knowledge"; }).slice(0, d.minds.memoriesPerNpc);
+      addLine(lines, "NPC " + jsonData(n.name) + " ANCHOR=" + jsonData(cutClause(n.profile, Math.min(160, d.minds.profileChars))), npcCap);
+      var knows = privateRanked.filter(function (r) { return r.e.owner === n.id && r.e.kind === "knowledge"; })
+        .sort(function (a, b) { return (b.score + (b.e.origin === "player:npc-knowledge" ? 8 : 0)) - (a.score + (a.e.origin === "player:npc-knowledge" ? 8 : 0)); })
+        .slice(0, d.minds.memoriesPerNpc).map(function (r) { return r.e; });
       var thoughts = live.filter(function (e) { return e.owner === n.id && e.kind === "mind"; });
-      knows.slice(0, 2).forEach(function (e) { if (addLine(lines, "ONLY " + jsonData(n.name) + " KNOWS/AWARENESS " + e.id + "=" + jsonData(e.text), npcCap)) recalled.push(e.id); });
-      thoughts.forEach(function (e) { if (addLine(lines, "ONLY " + jsonData(n.name) + " INFERRED " + e.slot + "=" + jsonData(e.text), npcCap)) recalled.push(e.id); });
+      var mind = {};
+      thoughts.forEach(function (e) { mind[e.slot] = e.text; });
+      if (thoughts.length && addLine(lines, "ONLY " + jsonData(n.name) + " INFERRED MIND=" + jsonData(mind), npcCap)) {
+        thoughts.forEach(function (e) { recalled.push(e.id); });
+      } else thoughts.sort(function (a, b) {
+        return ["goal", "intention", "feeling"].indexOf(a.slot) - ["goal", "intention", "feeling"].indexOf(b.slot);
+      }).forEach(function (e) { if (addLine(lines, "ONLY " + jsonData(n.name) + " INFERRED " + e.slot + "=" + jsonData(e.text), npcCap)) recalled.push(e.id); });
       privateRanked.filter(function (r) { return r.e.owner === n.id && r.e.kind === "belief"; }).slice(0, 1).forEach(function (r) {
         if (addLine(lines, "ONLY " + jsonData(n.name) + " BELIEVES (MAY BE WRONG) " + r.e.id + "=" + jsonData(r.e.text), npcCap)) recalled.push(r.e.id);
       });
+      knows.slice(0, 2).forEach(function (e) { if (addLine(lines, "ONLY " + jsonData(n.name) + " KNOWS/AWARENESS " + e.id + "=" + jsonData(e.text), npcCap)) recalled.push(e.id); });
     });
     var quoted = Object.create(null);
     allEvents(d).forEach(function (e) { if (recalled.indexOf(e.id) >= 0) quoted[norm(e.text)] = true; });
-    ranked.slice(0, 24).forEach(function (r) {
+    var worldRows = ranked.filter(function (r) {
+      return recalled.indexOf(r.e.id) < 0 && !r.e.pinned && !own(quoted, norm(r.e.text)) && (r.match || frame() - r.e.order < 8);
+    });
+    diverseRows(d, worldRows, 24).forEach(function (r) {
       var e = r.e;
       if (recalled.indexOf(e.id) >= 0 || e.pinned || own(quoted, norm(e.text))) return;
       var label = e.kind === "intent" ? "PLAYER REQUEST, NOT CONFIRMED" : e.kind === "fact" || e.kind === "relation" ? (e.manual ? "CANON" : "CURRENT STATE EVIDENCE") : e.kind === "card" ? "AUTHORED WORLD CARD" : e.kind === "thread" ? "COMMITMENT HISTORY" : "NARRATOR EVIDENCE, NOT AUTOMATIC NPC KNOWLEDGE";
@@ -980,9 +1284,12 @@ var Remanence = (function () {
     d.stats.recalled = 0; d.stats.packetChars = 0; d.stats.trace = []; d.request = null;
     d.stats.delivery = { capacity: Math.max(0, cap), skipped: cap < 350 ? "Existing memory/recent story leaves too little room." : "", displaced: 0 };
     if (cap < 350) return { text: original };
-    var query = recentText() + "\n" + body.slice(-1200);
+    var recent = actions().slice(-2).map(function (a) { return stripMeta(str(a.text) || str(a.rawText)); }).filter(function (s) { return !isAdmin(s); });
+    var query = recent.reverse().join("\n").slice(0, 4000) + "\n" + body.slice(-1200);
     var available = activeNpcs(d, query), req = null;
-    var canAsk = d.minds.enabled && d.minds.modelUpdates && d.stats.outputs % d.minds.updateEvery === 0;
+    var interval = d.minds.updateEvery, cycle = interval * 4 + (interval > 1 ? 1 : 0);
+    var cadence = d.stats.outputs % cycle;
+    var canAsk = d.minds.enabled && d.minds.modelUpdates && cadence < interval * 4 && cadence % interval === 0;
     if (canAsk) req = requestInstruction(d, available, hash(frame() + "|" + hash(recentText()) + "|" + d.stats.outputs));
     if (req && req.text.length + 450 > cap) req = null;
     var p = packet(d, query, cap - (req ? req.text.length : 0));
@@ -997,13 +1304,16 @@ var Remanence = (function () {
     d.stats.delivery.displaced = Math.max(0, body.length - tail.length);
     return { text: finalText };
   }
-  function exactEvidence(prose, value) {
+  function exactEvidence(prose, value, unquotedOnly) {
     return typeof value === "string" && value.length >= 20 && value.length <= 480 &&
-      /[.!?]["'”’]*$/.test(value.trim()) && norm(prose).indexOf(norm(value)) >= 0;
+      /[.!?]["'”’]*$/.test(value.trim()) && sentences(prose, 20000, 128, unquotedOnly).some(function (sentence) { return norm(sentence) === norm(value); });
   }
   function footer(d, raw, clean, source) {
     var at = raw.indexOf(START), end = raw.indexOf(END, at);
     var req = d.request;
+    if (!d.minds.enabled || !d.minds.modelUpdates) {
+      d.request = null; if (at >= 0) d.stats.rejected++; return;
+    }
     if (at < 0) { if (req) d.stats.missing++; return; }
     if (!req || end < 0 || raw.indexOf(START, at + START.length) >= 0) { d.stats.rejected++; return; }
     var open = raw.indexOf("]", at), marker = raw.slice(at, open + 1);
@@ -1014,20 +1324,24 @@ var Remanence = (function () {
     try { parsed = JSON.parse(body); } catch (_) { d.stats.rejected++; return; }
     if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") { d.stats.rejected++; return; }
     var allowed = ["memories", "knowledge", "minds", "beliefs"];
-    if (Object.keys(parsed).some(function (k) { return allowed.indexOf(k) < 0; })) { d.stats.rejected++; return; }
+    if (Object.keys(parsed).some(function (k) { return allowed.indexOf(k) < 0 || !Array.isArray(parsed[k]); })) { d.stats.rejected++; return; }
+    function shape(item, keys) {
+      return item && !Array.isArray(item) && typeof item === "object" && Object.keys(item).every(function (key) { return keys.indexOf(key) >= 0; });
+    }
     var accepted = 0, rejected = 0;
     (d.core.autoMemory && Array.isArray(parsed.memories) ? parsed.memories : []).slice(0, 2).forEach(function (m) {
-      if (!m || !exactEvidence(clean, m.evidence)) { rejected++; return; }
+      if (!shape(m, ["evidence"]) || !exactEvidence(clean, m.evidence) ||
+          (exactEvidence(clean, m.evidence, true) && mentalStatement(d, m.evidence))) { rejected++; return; }
       record(d, { text: m.evidence, entities: mentions(d, m.evidence), origin: "model:grounded-excerpt" }, source); accepted++;
     });
     (Array.isArray(parsed.knowledge) ? parsed.knowledge : []).slice(0, 1).forEach(function (k) {
       var n = k && resolve(d, k.npc);
-      if (!n || n.id !== req.target || isPlayer(d, n.name) || !exactEvidence(clean, k.evidence) || !explicitKnowledge(d, n, k.evidence)) { rejected++; return; }
+      if (!shape(k, ["npc", "evidence"]) || !n || n.id !== req.target || isPlayer(d, n.name) || !exactEvidence(clean, k.evidence, true) || !explicitKnowledge(d, n, k.evidence)) { rejected++; return; }
       record(d, { text: k.evidence, owner: n.id, entities: [n.id], kind: "knowledge", importance: 7, visibility: "private", origin: "model:explicit-observation" }, source); accepted++;
     });
     (Array.isArray(parsed.minds) ? parsed.minds : []).slice(0, 1).forEach(function (m) {
       var n = m && resolve(d, m.npc);
-      if (!n || n.id !== req.target || isPlayer(d, n.name) || !exactEvidence(clean, m.evidence) || !directActor(d, n, m.evidence)) { rejected++; return; }
+      if (!shape(m, ["npc", "evidence", "goal", "feeling", "intention"]) || !n || n.id !== req.target || isPlayer(d, n.name) || !exactEvidence(clean, m.evidence, true) || !directActor(d, n, m.evidence)) { rejected++; return; }
       ["goal", "feeling", "intention"].forEach(function (field) {
         var value = str(m[field]).trim();
         if (!value) return;
@@ -1037,11 +1351,11 @@ var Remanence = (function () {
       });
     });
     (Array.isArray(parsed.beliefs) ? parsed.beliefs : []).slice(0, 1).forEach(function (b) {
-      var n = b && resolve(d, b.npc), value = b && str(b.belief).trim();
-      if (!n || n.id !== req.target || isPlayer(d, n.name) || !exactEvidence(clean, b.evidence) || !value || value.length > d.minds.mindChars || norm(b.evidence).indexOf(norm(value)) < 0 || !evidenceNames(d, n).some(function (name) {
-        return norm(b.evidence).indexOf(norm(name) + " ") === 0 && /^\s+(?:believes|believed|suspects|suspected|thinks|thought|assumes|assumed)\b/.test(norm(b.evidence).slice(norm(name).length));
-      })) { rejected++; return; }
-      record(d, { kind: "belief", text: value, slot: "claim:" + hash(norm(value)), owner: n.id, entities: [n.id],
+      var n = b && resolve(d, b.npc), value = b && str(b.belief).trim(), mental = b && mentalStatement(d, str(b.evidence));
+      if (!shape(b, ["npc", "evidence", "belief"]) || !n || n.id !== req.target || isPlayer(d, n.name) ||
+          !exactEvidence(clean, b.evidence, true) || !mental || mental.kind !== "belief" || mental.withdrawn || mental.n.id !== n.id ||
+          !value || value.length > d.minds.mindChars || mental.claim.length > d.minds.mindChars || claimText(value) !== claimText(mental.claim)) { rejected++; return; }
+      record(d, { kind: "belief", text: mental.claim, slot: "claim:" + hash(norm(mental.claim)), owner: n.id, entities: [n.id],
         importance: 6, visibility: "private", origin: "model:explicit-belief" }, source); accepted++;
     });
     d.stats.accepted += accepted; d.stats.rejected += rejected;
@@ -1056,7 +1370,9 @@ var Remanence = (function () {
       "Archive: " + d.archive.length + "/" + d.core.maxEpisodes + " excerpts; archived: " + d.stats.archived + "; archive removals: " + d.stats.archiveEvicted + "\n" +
       "Open commitments: " + openThreads(d).length + "; suppressed excerpts: " + d.exclusions.length + "; detected canon conflicts: " + conflicts(d).length + "\n" +
       "NPCs: " + d.npcs.length + "/" + d.minds.maxNpcs + "; last recall: " + d.stats.recalled + " records / " + d.stats.packetChars + " chars\n" +
+      "Automatic capture: up to " + d.core.capturePerAction + " evidence sentences / " + d.core.captureChars + " scanned chars per action; direct NPC knowledge " + (d.minds.autoKnowledge ? "ON" : "OFF") + "; direct beliefs " + (d.minds.autoBeliefs ? "ON" : "OFF") + "\n" +
       "Grounded/inferred footer fields accepted: " + d.stats.accepted + "; rejected: " + d.stats.rejected + "; missing footers: " + d.stats.missing + "\n" +
+      "Proven legacy public duplicates repaired: " + d.stats.privacyRepaired + "\n" +
       "Evicted unprotected records: " + d.stats.evicted + "; invalidated by recent edits/retries: " + d.stats.rewound + "\n" +
       "Recent script errors: " + d.stats.errors.length + (d.stats.errors.length ? " — " + d.stats.errors[d.stats.errors.length - 1] : "") + "\n" +
       "Storage and recalled context are bounded. Check View Context for REMANENCE MEMORY; stored data alone does not prove the model received it.";
@@ -1068,8 +1384,9 @@ var Remanence = (function () {
       return { text: ADMIN + "\n" + reply };
     }
     if (!d.core.enabled) {
+      d.request = null;
       if (raw.indexOf("[REMANENCE_DATA") >= 0 || raw.indexOf("[CONTINUITY_DATA") >= 0) return { text: stripMeta(raw) || "[Remanence command]\nNo story prose returned; retry this response." };
-      return { text: raw };
+      return { text: raw || "[Remanence command]\nNo story prose returned; retry this response." };
     }
     var clean = stripMeta(raw);
     if (!clean) {
@@ -1099,6 +1416,11 @@ var Remanence = (function () {
   }
 
   function protectedWrite(d, fields) {
+    var same = liveEvents(d).find(function (e) {
+      return e.pinned && e.manual && e.kind === fields.kind && e.owner === (fields.owner || "") &&
+        e.slot === (fields.slot || "") && norm(e.text) === norm(fields.text);
+    });
+    if (same) return "Protected " + same.id + ": " + same.text + " (already recorded).";
     var previous = fields.slot ? d.events.filter(function (e) {
       return e.pinned && e.kind === fields.kind && e.owner === (fields.owner || "") && e.slot === fields.slot;
     }) : [];
@@ -1110,11 +1432,13 @@ var Remanence = (function () {
     prune(d); return "Protected " + e.id + ": " + e.text;
   }
   function reportRecord(e) {
-    return e.id + (e.pinned ? " [protected]" : "") + (!e.words ? " [archived]" : "") + " [" + e.kind + ", " + e.origin + ", @" + e.created + "] " + e.text;
+    return e.id + (e.pinned ? " [protected]" : "") + (!e.words ? " [archived]" : "") + (e.historicalOnly ? " [historical only; newer value unavailable]" : "") + (e.beliefStatus === "withdrawn" ? " [withdrawn belief]" : "") + " [" + e.kind + ", " + e.origin + ", @" + e.created + "] " + e.text;
   }
   function manualMind(d, n, field, value) {
     if (["goal", "feeling", "intention"].indexOf(field) < 0) return "Use goal, feeling or intention.";
     if (!value || value.length > d.minds.mindChars) return "Mind text must be 1–" + d.minds.mindChars + " characters.";
+    var same = liveEvents(d).find(function (e) { return e.manual && e.kind === "mind" && e.owner === n.id && e.slot === field && norm(e.text) === norm(value); });
+    if (same) return "Set " + n.name + "'s " + field + " (" + same.id + ", already recorded).";
     var e = record(d, { text: value, kind: "mind", slot: field, owner: n.id, entities: [n.id],
       visibility: "private", manual: true, origin: "player:npc-direction", importance: 8 }, null);
     prune(d); return "Set " + n.name + "'s " + field + " (" + e.id + ").";
@@ -1162,6 +1486,14 @@ var Remanence = (function () {
         if (!s || (s.seq !== null && !Number.isFinite(s.seq)) || !str(s.anchor) || !Number.isFinite(s.frame) || str(s.card).length > 100) valid = false;
         return { seq: s ? s.seq : null, anchor: s ? str(s.anchor).slice(0, 40) : "", frame: s ? integer(s.frame, 0) : 0, card: s ? str(s.card) : "" };
       });
+      var retiredSources = [];
+      if (e.historicalOnly === true) {
+        if (!Number.isFinite(e.retiredAt) || !Number.isFinite(e.retiredAuthority) || !Array.isArray(e.retiredSources) || e.retiredSources.length > 3) valid = false;
+        retiredSources = (Array.isArray(e.retiredSources) ? e.retiredSources : []).slice(0, 3).map(function (s) {
+          if (!s || (s.seq !== null && !Number.isFinite(s.seq)) || !str(s.anchor) || !Number.isFinite(s.frame) || str(s.card).length > 100) valid = false;
+          return { seq: s ? s.seq : null, anchor: s ? str(s.anchor).slice(0, 40) : "", frame: s ? integer(s.frame, 0) : 0, card: s ? str(s.card) : "" };
+        });
+      }
       var subject = str(e.subject).slice(0, 80), attribute = str(e.attribute).slice(0, 80), value = str(e.value).slice(0, 700);
       if (p.schema === 1 && e.kind === "fact" && e.slot) {
         var fields = str(e.slot).split("|"); subject = fields[0] || ""; attribute = fields[1] || "";
@@ -1172,16 +1504,23 @@ var Remanence = (function () {
       var item = { id: e.id, kind: e.kind, text: e.text,
         owner: str(e.owner), entities: e.entities.filter(function (id) { return own(ids, id) && /^n/.test(id); }).slice(0, 8),
         slot: str(e.slot).slice(0, 180), importance: clamp(integer(e.importance, 5), 1, 10), pinned: !!e.pinned, manual: !!e.manual,
-        visibility: PRIVATE_KINDS.indexOf(e.kind) >= 0 ? "private" : e.visibility === "public" ? "public" : e.visibility === "private" ? "private" : "narrator",
+        visibility: e.owner || PRIVATE_KINDS.indexOf(e.kind) >= 0 ? "private" : e.visibility === "public" ? "public" : e.visibility === "private" ? "private" : "narrator",
         origin: str(e.origin).slice(0, 80), sources: sources, created: Math.max(0, integer(e.created, 0)), touched: Math.max(0, integer(e.touched, 0)),
         order: Math.max(0, integer(e.order, e.created)), subject: subject, attribute: attribute, value: value, edge: edge,
         relation: relationType(e.relation), threadStatus: e.threadStatus === "resolved" ? "resolved" : e.kind === "thread" ? "open" : "",
         tags: Array.isArray(e.tags) ? e.tags.slice(0, 24).map(function (s) { return str(s).slice(0, 40); }) : [] };
+      if (e.beliefStatus !== undefined && (e.kind !== "belief" || e.beliefStatus !== "withdrawn")) valid = false;
+      if (e.kind === "belief" && e.beliefStatus === "withdrawn") item.beliefStatus = "withdrawn";
+      if (e.historicalOnly === true) {
+        item.historicalOnly = true; item.retiredAt = Math.max(0, integer(e.retiredAt, 0));
+        item.retiredAuthority = clamp(integer(e.retiredAuthority, 0), 0, 2); item.retiredSources = retiredSources;
+      }
       if (p.schema === 1 && e.kind === "relation") {
         var match = e.text.match(/^(.+?) → (.+?): (.+)$/);
         if (match) { item.edge = [match[1], match[2]]; item.subject = match[1]; item.value = match[2]; item.relation = relationType(match[3]); }
       }
-      if (!isArchived) { item.key = recordKey(item); item.words = tokens(item.text); }
+      if (!isArchived) { item.key = recordKey(item); item.words = indexWords(item); }
+      else item.lex = indexWords(item).join(" ");
       return item;
     }
     var newEvents = p.events.map(function (e) { return readRecord(e, false); });
@@ -1192,9 +1531,10 @@ var Remanence = (function () {
     var candidate = { core: c, minds: m, events: newEvents, archive: newArchive, npcs: newNpcs };
     limits(candidate);
     if (newEvents.length > c.maxMemories || ledgerChars(candidate) > c.maxArchiveChars || pinnedCount(candidate) > c.maxPinned || newArchive.length > c.maxEpisodes ||
-      newArchive.reduce(function (n, e) { return n + e.text.length; }, 0) > c.episodeChars || JSON.stringify(candidate).length > HARD_BYTES) return "Backup exceeds its configured capacity; current data preserved.";
+      newArchive.reduce(function (n, e) { return n + e.text.length; }, 0) > c.episodeChars || serializedBytes(candidate) > HARD_BYTES) return "Backup exceeds its configured capacity; current data preserved.";
     d.core = c; d.minds = m; d.events = newEvents; d.archive = newArchive; d.exclusions = exclusions.slice(); d.npcs = newNpcs;
     d.explicitPlayer = validName(p.explicitPlayer); d.scene = null; d.request = null;
+    identityCache = null; invalidateViews(); repairPrivateCopies(d);
     d.nextId = Math.max(clamp(integer(p.nextId, 1), 1, 10000000000), newEvents.concat(newArchive, newNpcs).reduce(function (v, e) { return Math.max(v, Number(e.id.slice(1)) + 1); }, 1));
     d.warmed = true; d.backupCache = null; writeSettings(d);
     return "Restored " + d.events.length + " active records, " + d.archive.length + " archived records and " + d.npcs.length + " NPCs. Restore into the matching adventure history. Recent derived records absent from that history are invalidated on the next context call.";
@@ -1202,7 +1542,8 @@ var Remanence = (function () {
   function promote(d, e) {
     if (d.events.some(function (x) { return x.id === e.id; })) return;
     d.archive = d.archive.filter(function (x) { return x.id !== e.id; });
-    e.key = recordKey(e); e.words = tokens(e.text); d.events.push(e);
+    e.key = recordKey(e); e.words = indexWords(e); delete e.lex; d.events.push(e);
+    invalidateViews();
   }
   function forgetRecord(d, e) {
     var key = suppressionKey(e);
@@ -1403,7 +1744,7 @@ var Remanence = (function () {
         if (!n) return "NPC not found or name ambiguous. Use the exact full name from /npcs.";
         if (parts.length === 3) return manualMind(d, n, parts[1], parts[2]);
         if (parts.length !== 1) return "Use /mind Full Name, or /mind Full Name | goal | text.";
-        var mindRows = liveEvents(d).filter(function (x) { return x.owner === n.id; });
+        var mindRows = liveEvents(d).filter(function (x) { return x.owner === n.id && x.beliefStatus !== "withdrawn"; });
         function priority(a, b) {
           return Number(b.pinned) - Number(a.pinned) || Number(b.manual) - Number(a.manual) ||
             b.importance - a.importance || b.touched - a.touched || Number(b.id.slice(1)) - Number(a.id.slice(1));
@@ -1462,20 +1803,40 @@ var Remanence = (function () {
     return { text: ADMIN + " Reply with OK; do not advance the story." };
   }
   function run(hook, value) {
-    var original = str(value), d;
+    var original = str(value), d, rollback = null, configRollback = [];
     // Cache lexical work only inside this hook; never retain it in script state.
     searchCache = Object.create(null);
+    identityCache = null;
+    invalidateViews();
     try {
       d = boot(); configure(d);
-      if (hook === "input") return input(d, original);
+      if (hook === "input") {
+        var parsed = parseCommand(original);
+        if (parsed && !/^(help|status|diagnose|why|recall|timeline|archive|memory|npcs|where|inventory|connections|threads|conflicts|excluded|export)$/.test(parsed.name)) {
+          rollback = JSON.stringify(d);
+          configRollback = cards().filter(function (c) { return c && (c.keys === CORE_KEY || c.keys === MIND_KEY); }).map(function (c) { return JSON.parse(JSON.stringify(c)); });
+        }
+        return input(d, original || "\n");
+      }
       if (hook === "context") return context(d, original);
       if (hook === "output") return output(d, original);
       return { text: original };
     } catch (error) {
       var message = error && error.message ? error.message : "Unknown script error";
       logLine(message);
+      if (rollback) {
+        d = JSON.parse(rollback); state[ROOT] = d;
+        configRollback.forEach(function (saved) {
+          var c = cards().find(function (item) { return item && item.keys === saved.keys; });
+          if (c) { Object.keys(c).forEach(function (key) { delete c[key]; }); Object.assign(c, saved); }
+        });
+      }
       if (d && d.stats && Array.isArray(d.stats.errors)) {
         d.stats.errors.push(message.slice(0, 220)); if (d.stats.errors.length > 5) d.stats.errors.shift();
+      }
+      if (rollback) {
+        d.control = { frame: frame(), reply: "Command failed; previous memory and settings preserved. " + message };
+        return { text: ADMIN + " Reply with OK; do not advance the story." };
       }
       var cleaned = hook === "output" ? stripMeta(original) : original;
       return { text: cleaned || (hook === "output" ? "" : original) || "[Remanence command]\nNo story text returned; retry this response." };

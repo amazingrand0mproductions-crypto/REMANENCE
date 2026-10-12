@@ -100,25 +100,32 @@ The full reference is [docs/SETTINGS.md](docs/SETTINGS.md). Editing examples and
 
 ## Optimised Context
 
-Leave `deliveryMode = "auto"` for normal use. When AI Dungeon reports Optimised Context through `info.useCacheEfficient`, REMANENCE prepares recall in one managed native Story Card: **REMANENCE — Recall**. This is the delivery card; Memory and Minds remain the only two configuration cards.
+The Context file begins with the platform's opt-in:
 
-The Recall card is refreshed during ordinary Input and Output, with Context providing an additional refresh and an inclusion check when the platform exposes its lore. Recall can therefore reach native context even when returned Context-script text is ignored. The script leaves Plot Essentials and Author's Note alone.
+```js
+// @cache-compatible
+```
 
-The native packet is smaller than the usual Context packet. Complete evidence rows take priority; focused private knowledge comes before optional profile detail. Optional updates use a compact request, and short-lived request receipts allow a delayed native reply to be validated.
+**Keep that first line when copying the file.** It belongs above the Context modifier. The complete four-tab package includes it in both `scripts/Context.js` and `ALL_TABS.txt`.
 
-**Use View Context to check inclusion.** The script requests native pinning for the Recall card automatically through AI Dungeon's documented `isPinned` property. Set `pinRecall = false` to request unpinning. Authored pins stay as they are.
+With `deliveryMode = "auto"`, REMANENCE appends recall after the **entire unchanged incoming prompt** when Optimised Context is on or the mode signal is unavailable. Instructions, Plot Essentials, Story Cards, recent story, Author's Note and their whitespace stay in place. The suffix uses only the current hook's reported spare capacity, with a safety margin; it cannot trim the cached prompt to make room.
 
-Native pin limits can refuse the change, and Story Cards share a finite allowance. A prepared card can still be omitted; selection may take a turn to catch up. If automatic pinning is unsupported, use **only the Recall card's** UI pin control. Reduce `cardBudget` and competing entries if native space is crowded. Pinning still uses the platform's available card space.
+When the host explicitly reports Optimised Context off, auto uses the normal Context route. A forced `context` setting still uses the safe suffix path if the host reports optimisation on or omits its signal.
+
+If a complete suffix cannot fit, auto prepares one native **REMANENCE — Recall** card for a following turn. This delivery card is separate from the two configuration cards. Native space, triggers and pin limits still apply. A card prepared after Context construction is not reported as having reached that already assembled prompt.
+
+The Recall card requests native pinning through the documented `isPinned` property. `pinRecall = false` requests unpinning of that card only. Authored pins stay untouched. If automatic pinning is unsupported, the Recall card's UI pin control is available.
 
 | `deliveryMode` | Behaviour |
 | --- | --- |
-| `"auto"` | Use the latest supplied mode signal. Native card delivery when true; direct Context delivery otherwise. |
-| `"card"` | Force native delivery if the platform omits the signal. Useful when Optimised Context is on but automatic detection is unavailable. |
-| `"context"` | Force direct Context insertion. Use where the model accepts Context changes; it cannot override platform restrictions. |
+| `"auto"` | Safe cached suffix when optimisation is true/unknown, normal insertion when explicitly false, and native fallback when the suffix has no room. |
+| `"cached"` | Use only the suffix route, even with normal context. Skip recall if a complete packet does not fit. |
+| `"context"` | Request normal insertion; optimisation true/unknown still selects the safe cached route. |
+| `"card"` | Force the native Recall card route for legacy hosts or a deliberate card-based setup. |
 
-If the signal first arrives in Context or Output, native delivery may need a warm-up turn. Switching back to direct delivery removes the managed Recall card. Disabling the master switch clears it. A stale or echoed packet is stripped from ordinary output before capture.
+**Use View Context to check delivery.** On the suffix route, look near the end for `REMANENCE MEMORY`. If no packet fits, a diagnostic explains that and the native fallback may need an ordinary turn. A prepared card alone does not establish inclusion.
 
-Details, platform sources and the live setup checklist are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) and [docs/RESEARCH.md](docs/RESEARCH.md).
+Card creation failures leave retained settings and history-based recall running. Check the console if the configuration guide or native fallback could not be created. Details and the live checklist are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
 ## Ordinary play
 
@@ -128,7 +135,7 @@ Once the characters are known, clear narrator statements can establish details s
 Maya Walker is allergic to penicillin.
 Ruth Barker lives at 12 Baker Street.
 Ruth Barker learns the hatch code is 7392.
-Ruth Barker suspects Dan Mercer stole the missing ledger.
+Ruth Barker suspects Dan Barker stole the missing ledger.
 Ruth Barker wants to check the evidence before accusing anyone.
 Ruth Barker picks up the brass key.
 Ruth Barker promises to return the brass key to Maya Walker.
@@ -138,7 +145,7 @@ Later narration can change them:
 
 ```text
 Ruth Barker lives at 28 Railway Road.
-Ruth Barker no longer suspects Dan Mercer stole the missing ledger.
+Ruth Barker no longer suspects Dan Barker stole the missing ledger.
 Ruth Barker returns the brass key to Maya Walker.
 ```
 

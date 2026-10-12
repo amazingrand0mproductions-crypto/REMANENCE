@@ -1,5 +1,5 @@
 /*
- * REMANENCE — Memory & Living Minds v2.5.0
+ * REMANENCE — Memory & Living Minds v2.6.0
  * Original implementation. MIT licensed; see LICENSE.
  * Paste this entire file into AI Dungeon's Library tab.
  * No network calls, dependencies, eval, or additional model API required.
@@ -7,13 +7,13 @@
 var Remanence = (function () {
   "use strict";
 
-  var VERSION = "2.5.0";
+  var VERSION = "2.6.0";
   var SCHEMA = 2;
   var ROOT = "remanenceV2";
   var CORE_KEY = "__remanence_settings_memory__";
   var MIND_KEY = "__remanence_settings_minds__";
   var RELAY_KEY = "__remanence_delivery__";
-  var ENUMS = { deliveryMode: ["auto", "context", "card"] };
+  var ENUMS = { deliveryMode: ["auto", "context", "cached", "card"] };
   var START = "[REMANENCE_DATA:";
   var END = "[/REMANENCE_DATA]";
   var HARD_BYTES = 1000000;
@@ -21,6 +21,7 @@ var Remanence = (function () {
   var viewCache = null;
   var liveCache = null;
   var identityCache = null;
+  var activeHook = "";
   var playerCache = null;
   var ADMIN = "[REMANENCE CONTROL]";
   var CORE = {
@@ -100,7 +101,7 @@ var Remanence = (function () {
     "remember fact pin unpin forget correct allow player npc alias mind know believe relation carry drop thread resolve scene " +
     "scan remanence continuity minds log set restore import preset").split(" ").forEach(function (name) { COMMANDS[name] = true; });
   var EXPLAIN_CORE = {
-    deliveryMode: "auto uses native Story Card delivery when info.useCacheEfficient is true, otherwise the Context hook. card forces native delivery when the platform omits its mode signal; context forces direct delivery and will not bypass platform restrictions. Card delivery creates one managed Recall card in addition to the two configuration cards. Keep the configuration cards unpinned. Native budgets and a possible warm-up turn still apply.",
+    deliveryMode: "auto appends recall after the complete unchanged prompt when Optimised Context is reported or its signal is missing; a reported false flag enables normal Context insertion. The Context tab must retain its first line // @cache-compatible. Auto can prepare one native Recall card for the next turn when no complete suffix fits. cached forces suffix-only delivery; context uses normal insertion only when optimisation is explicitly off; card forces native delivery for legacy hosts. Native selection and pin limits still apply. Keep both configuration cards unpinned.",
     pinRecall: "Request native pinning for only the managed Recall card through the documented isPinned property, giving it inclusion priority. false requests unpinning of that card. Authored pins are never changed. Native pin limits can refuse a change, and pinning cannot bypass available context space. On runtimes without this capability, use the Recall card's UI pin control and check View Context.",
     cardBudget: "Maximum characters in the native Recall card, range 350–3000; default 1600. The effective allowance also respects memoryBudget, budgetShare and a conservative share of the last reported context size. Shorter packets preserve complete labelled rows instead of clipping sentences. Native Story Card selection can still exclude the card; check View Context. This controls delivered excerpts, not stored memory.",
     enabled: "Master switch. false suspends automatic capture, recall and minds; slash commands still work.",
@@ -453,7 +454,7 @@ var Remanence = (function () {
     return completed.length <= 20000 && completed.split(/\r?\n/).length <= 256 ? completed : entry;
   }
   function putConfig(index, key, entry, type, title, notes) {
-    if (typeof updateStoryCard === "function") updateStoryCard(index, key, entry, type, title, notes);
+    if (typeof updateStoryCard === "function" && updateStoryCard(index, key, entry, type, title, notes) === false) throw new Error("Configuration card write was refused.");
     var c = cards()[index];
     if (!c) return;
     // Legacy helpers ignore extra arguments; mutable runtimes still get the guide.
@@ -474,7 +475,10 @@ var Remanence = (function () {
     var notes = configNotes(defaults, explanations, kind);
     var index = findConfig(key);
     if (index < 0 && typeof addStoryCard === "function") {
-      var result = addStoryCard(key, configEntry(defaults, current), "remanence-config", title, notes);
+      var result;
+      try { result = addStoryCard(key, configEntry(defaults, current), "remanence-config", title, notes); }
+      catch (_) { d.stats.settingsIssues.push(kind + ": card creation unavailable; retained settings and ordinary memory remain active."); }
+      if (result === false) d.stats.settingsIssues.push(kind + ": card creation refused; retained settings remain active.");
       // Zero is a valid successful index. false is not.
       index = typeof result === "number" && result >= 0 && result % 1 === 0 && cards()[result] &&
         str(cards()[result].keys) === key ? result : findConfig(key);
@@ -1837,16 +1841,26 @@ var Remanence = (function () {
     b.stamps = b.stamps.filter(function (s) { return s && typeof s.id === "string" && s.id.length <= 80 && frame() >= s.frame && frame() <= s.frame + 4; }).slice(-2);
     var meta = typeof info === "object" && info ? info : {};
     if (typeof meta.useCacheEfficient === "boolean") b.cached = meta.useCacheEfficient;
-    if (Number.isFinite(meta.maxChars)) b.maxChars = clamp(Math.floor(meta.maxChars), 0, 2000000);
-    var mode = d.core.deliveryMode === "card" || (d.core.deliveryMode === "auto" && b.cached === true) ? "card" : "context";
+    if (Number.isFinite(meta.maxChars)) { b.maxChars = clamp(Math.floor(meta.maxChars), 0, 2000000); b.maxCharsKnown = true; }
+    // A missing cache flag must never authorize editing a potentially cached prefix.
+    var suppliedMode = typeof meta.useCacheEfficient === "boolean";
+    var safeSuffix = activeHook === "context" ? meta.useCacheEfficient !== false :
+      suppliedMode ? meta.useCacheEfficient === true : b.mode ? b.mode !== "context" : b.cached !== false;
+    var mode = d.core.deliveryMode === "card" ? "card" :
+      d.core.deliveryMode === "cached" || safeSuffix ? "cached" : "context";
     if (b.mode && b.mode !== mode) {
-      b.leases = []; b.stamps = []; d.request = null;
+      b.leases = []; b.stamps = []; d.request = null; b.nativeFallback = false;
       var health = footerState(d); health.misses = 0; health.delay = 0; health.until = 0; health.receipt = null;
     }
     if (d.request && d.request.card && !b.leases.some(function (r) { return r.nonce === d.request.nonce; })) d.request = null;
     b.mode = mode;
+    if (mode !== "cached" || d.core.deliveryMode !== "auto") b.nativeFallback = false;
     if (!d.core.enabled) { b.leases = []; b.stamps = []; d.request = null; }
     return b;
+  }
+  function nativeDelivery(d) {
+    var b = relayState(d);
+    return b.mode === "card" || (b.mode === "cached" && d.core.deliveryMode === "auto" && b.nativeFallback === true);
   }
   function relayIssue(d, message) {
     var b = relayState(d);
@@ -1918,7 +1932,7 @@ var Remanence = (function () {
   }
   function publishRelay(d, body, ask) {
     var b = relayState(d);
-    if (b.mode !== "card" || !d.core.enabled || d.control) { clearRelay(d); return; }
+    if (!nativeDelivery(d) || !d.core.enabled || d.control) { clearRelay(d); return; }
     var cap = Math.floor(Math.min(d.core.cardBudget, d.core.memoryBudget, b.maxChars * d.core.budgetShare, b.maxChars * 0.08));
     // Opening/closing receipts and provenance consume real card space.
     d.stats.delivery = { mode: "card", capacity: Math.max(0, cap), skipped: "", displaced: 0, observed: false };
@@ -1983,15 +1997,52 @@ var Remanence = (function () {
     }) || null : null;
     return found;
   }
+  function cachedContext(d, original) {
+    var b = relayState(d), observed = observeRelay(d, original), activeRequest = d.request;
+    // Cached suffix space must use this hook's limit, never a stale model limit.
+    var meta = typeof info === "object" && info ? info : {};
+    var max = Number.isFinite(meta.maxChars) ? clamp(Math.floor(meta.maxChars), 0, 2000000) : 0;
+    var room = max > 0 ? Math.max(0, max - original.length - 160) : 0;
+    var cap = Math.floor(Math.min(d.core.memoryBudget, max * d.core.budgetShare, room));
+    d.stats.delivery = { mode: "cached", capacity: cap, displaced: 0, observed: observed, skipped: "", nativeFallback: false };
+    d.stats.recalled = 0; d.stats.packetChars = 0; d.stats.trace = [];
+    d.stats.episodeNeighbors = 0; d.stats.historicalRows = 0;
+    var plan = cap >= 350 ? recallPlan(d, stripMeta(original), cap - 2, cap < 1700, true) : null;
+    if (plan) {
+      var suffix = "\n\n" + plan.text;
+      if (suffix.length <= room && original.length + suffix.length <= max) {
+        // The entire supplied prompt is immutable, including whitespace, cards,
+        // headings, story, guides and Author's Note. Only this suffix is added.
+        b.nativeFallback = false;
+        d.request = plan.request ? { nonce: plan.request.nonce, target: plan.request.target, frame: plan.request.frame } : null;
+        return { text: original + suffix };
+      }
+    }
+    d.request = activeRequest;
+    var reason = max > 0 ? "No complete recall suffix fits after the unchanged prompt." : "The platform did not report a context allowance.";
+    if (d.core.deliveryMode === "auto") {
+      // A full cache may have no suffix room. Stage native lore for a future
+      // construction; never claim it reached this already assembled prompt.
+      b.nativeFallback = true;
+      publishRelay(d, stripMeta(original), true);
+      d.request = activeRequest;
+      d.stats.delivery = { mode: "cached", capacity: cap, displaced: 0, observed: observed,
+        skipped: reason, nativeFallback: true, preparedChars: b.preparedChars || 0 };
+    } else {
+      d.stats.delivery.skipped = reason;
+    }
+    return { text: original };
+  }
   function context(d, original) {
     var b = relayState(d);
     if (d.control && frame() <= d.control.frame + 1) {
       clearRelay(d);
-      return { text: b.mode === "card" ? original : "Administrative REMANENCE command. Reply with OK. Do not advance the story. The Output script supplies the actual report." };
+      return { text: b.mode !== "context" ? original : "Administrative REMANENCE command. Reply with OK. Do not advance the story. The Output script supplies the actual report." };
     }
     d.control = null;
     if (!d.core.enabled) { d.request = null; clearRelay(d); return { text: original }; }
     syncEvidence(d);
+    if (b.mode === "cached") return cachedContext(d, original);
     if (b.mode === "card") {
       var observed = observeRelay(d, original), activeRequest = d.request;
       publishRelay(d, stripMeta(original), true);
@@ -2027,9 +2078,11 @@ var Remanence = (function () {
     var at = raw.indexOf(START), end = raw.indexOf(END, at);
     var req = d.request;
     var b = relayState(d);
-    if (at >= 0 && b.mode === "card") {
+    if (at >= 0 && (b.mode === "card" || b.mode === "cached")) {
       var openAt = raw.indexOf("]", at), received = openAt >= 0 ? raw.slice(at + START.length, openAt) : "";
-      req = b.leases.find(function (r) { return r.nonce === received; }) || null;
+      var receivedLease = b.leases.find(function (r) { return r.nonce === received; });
+      if (receivedLease) req = receivedLease;
+      else if (b.mode === "card" || !req || req.card) req = null;
       // A received valid lease is evidence the native request reached the model,
       // including platforms whose supplied Context text does not expose card lore.
     }
@@ -2158,9 +2211,9 @@ var Remanence = (function () {
     learnAction(d, clean, "continue", source);
     footer(d, raw, clean, source);
     d.stats.outputs++; prune(d);
-    if (relayState(d).mode === "card") publishRelay(d, clean, false);
+    if (nativeDelivery(d)) publishRelay(d, clean, false);
     if (d.core.statusEvery > 0 && (d.stats.outputs === 1 || d.stats.outputs % d.core.statusEvery === 0)) {
-      clean += "\n\n[Remanence · " + d.events.length + " memories · " + d.npcs.length + " NPCs · " + d.stats.recalled + (relayState(d).mode === "card" ? " prepared" : " recalled") +
+      clean += "\n\n[Remanence · " + d.events.length + " memories · " + d.npcs.length + " NPCs · " + d.stats.recalled + (nativeDelivery(d) ? " prepared" : " recalled") +
         " · " + (playerNames(d).length ? "player recognised" : "player unresolved") +
         " · " + d.events.filter(function (e) { return e.autoKept; }).length + " auto-kept" +
         " · minds " + (d.minds.enabled ? "on" : "off") + (d.footerHealth.delay ? " · updates slowed" : "") + "]";
@@ -2552,7 +2605,7 @@ var Remanence = (function () {
     if (!cmd) {
       d.control = null;
       d.latestInput = d.core.enabled ? { frame: frame(), text: stripMeta(original).slice(0, 1200) } : null;
-      if (relayState(d).mode === "card" && d.core.enabled) { d.request = null; syncEvidence(d); publishRelay(d, original, true); }
+      if (nativeDelivery(d) && d.core.enabled) { d.request = null; syncEvidence(d); publishRelay(d, original, true); }
       else if (cards().some(relayCard)) clearRelay(d);
       return { text: original };
     }
@@ -2568,6 +2621,7 @@ var Remanence = (function () {
   }
   function run(hook, value) {
     var original = str(value), d, rollback = null, configRollback = [], cardRestoreFailed = false;
+    activeHook = hook;
     // Cache lexical work only inside this hook; never retain it in script state.
     searchCache = Object.create(null);
     identityCache = null;
@@ -2575,7 +2629,7 @@ var Remanence = (function () {
     invalidateViews();
     try {
       d = boot(); configure(d); footerState(d); relayState(d); playerCache = null;
-      if (!d.core.enabled || relayState(d).mode !== "card") {
+      if (!d.core.enabled || !nativeDelivery(d)) {
         if (cards().some(relayCard)) clearRelay(d);
       }
       if (d.core.enabled) syncPlayer(d);

@@ -1,5 +1,5 @@
 /*
- * REMANENCE — Memory & Living Minds v2.4.0
+ * REMANENCE — Memory & Living Minds v2.5.0
  * Original implementation. MIT licensed; see LICENSE.
  * Paste this entire file into AI Dungeon's Library tab.
  * No network calls, dependencies, eval, or additional model API required.
@@ -7,11 +7,13 @@
 var Remanence = (function () {
   "use strict";
 
-  var VERSION = "2.4.0";
+  var VERSION = "2.5.0";
   var SCHEMA = 2;
   var ROOT = "remanenceV2";
   var CORE_KEY = "__remanence_settings_memory__";
   var MIND_KEY = "__remanence_settings_minds__";
+  var RELAY_KEY = "__remanence_delivery__";
+  var ENUMS = { deliveryMode: ["auto", "context", "card"] };
   var START = "[REMANENCE_DATA:";
   var END = "[/REMANENCE_DATA]";
   var HARD_BYTES = 1000000;
@@ -57,7 +59,10 @@ var Remanence = (function () {
     recallNeighbors: true,
     neighborWindow: 1,
     historicalRecall: true,
-    historyPerContext: 2
+    historyPerContext: 2,
+    deliveryMode: "auto",
+    cardBudget: 1600,
+    pinRecall: true
   };
   var MINDS = {
     enabled: true,
@@ -88,13 +93,16 @@ var Remanence = (function () {
     updateEvery: [1, 12], maxNpcs: [8, 80], activeNpcLimit: [1, 4],
     memoriesPerNpc: [4, 24], profileChars: [300, 1800], mindChars: [80, 280],
     scanCardsPerTurn: [8, 64], knowledgePerContext: [0, 6], beliefsPerContext: [0, 4],
-    neighborWindow: [0, 4], historyPerContext: [0, 4], updateBackoffMax: [3, 60]
+    neighborWindow: [0, 4], historyPerContext: [0, 4], updateBackoffMax: [3, 60], cardBudget: [350, 3000]
   };
   var COMMANDS = Object.create(null);
   ("help status diagnose why recall timeline archive memory npcs where inventory connections threads conflicts excluded export " +
     "remember fact pin unpin forget correct allow player npc alias mind know believe relation carry drop thread resolve scene " +
     "scan remanence continuity minds log set restore import preset").split(" ").forEach(function (name) { COMMANDS[name] = true; });
   var EXPLAIN_CORE = {
+    deliveryMode: "auto uses native Story Card delivery when info.useCacheEfficient is true, otherwise the Context hook. card forces native delivery when the platform omits its mode signal; context forces direct delivery and will not bypass platform restrictions. Card delivery creates one managed Recall card in addition to the two configuration cards. Keep the configuration cards unpinned. Native budgets and a possible warm-up turn still apply.",
+    pinRecall: "Request native pinning for only the managed Recall card through the documented isPinned property, giving it inclusion priority. false requests unpinning of that card. Authored pins are never changed. Native pin limits can refuse a change, and pinning cannot bypass available context space. On runtimes without this capability, use the Recall card's UI pin control and check View Context.",
+    cardBudget: "Maximum characters in the native Recall card, range 350–3000; default 1600. The effective allowance also respects memoryBudget, budgetShare and a conservative share of the last reported context size. Shorter packets preserve complete labelled rows instead of clipping sentences. Native Story Card selection can still exclude the card; check View Context. This controls delivered excerpts, not stored memory.",
     enabled: "Master switch. false suspends automatic capture, recall and minds; slash commands still work.",
     autoMemory: "Enable automatic story capture: selected complete evidence sentences and supported direct state, knowledge, belief and motivation extraction. Authored-source indexing and optional model updates have separate controls. Does not store every word or interpret Do/Say attempts as completed outcomes.",
     playerName: "Optional exact player name. Blank uses multiplayer names, name placeholders and explicit player markers in cards, Plot Essentials or the opening. Ambiguous names stay unresolved; NPC dialogue never selects the player. Edit this value if a correction is needed.",
@@ -280,8 +288,16 @@ var Remanence = (function () {
     }
     return false;
   }
+  function stripPackets(value) {
+    // Paired boundaries matter: a relay contains its own memory/request blocks.
+    // Remove the outer relay first, then standalone complete or unfinished blocks.
+    return str(value).replace(/\[REMANENCE RELAY:([^\]\n]*)\][\s\S]*?(?:\[\/REMANENCE RELAY:\1\]|$)/g, "")
+      .replace(/\[REMANENCE MEMORY[^\]\n]*\][\s\S]*?(?:\[\/REMANENCE MEMORY\]|$)/g, "")
+      .replace(/\[REMANENCE UPDATE REQUEST\][\s\S]*?(?:\[\/REMANENCE UPDATE REQUEST\]|$)/g, "")
+      .replace(/\[\/REMANENCE (?:RELAY:[^\]\n]*|MEMORY|UPDATE REQUEST)\]/g, "");
+  }
   function stripMeta(value) {
-    var s = str(value);
+    var s = stripPackets(value);
     // Remove complete and unfinished reserved footers, including stale/nonmatching nonces.
     var at = s.indexOf("[REMANENCE_DATA");
     while (at >= 0) {
@@ -396,7 +412,7 @@ var Remanence = (function () {
       "Invalid values retain the previous value; integer settings are rounded down and all numbers are clamped to the allowed range. Validation is logged once per changed issue list.\n" +
       "Never import a settings-only JSON over an existing card collection; imports replace all cards.\n\n" +
       Object.keys(defaults).map(function (k) {
-        var range = RANGES[k], allowed = typeof defaults[k] === "boolean" ? "true/false, on/off or yes/no" :
+        var range = RANGES[k], allowed = ENUMS[k] ? ENUMS[k].join(" / ") : typeof defaults[k] === "boolean" ? "true/false, on/off or yes/no" :
           range ? (k === "budgetShare" ? "number " : "integer ") + range[0] + "–" + range[1] : 'a full name in quotes, or ""';
         return k + ": " + explanations[k] + "\nDefault: " + JSON.stringify(defaults[k]) + ". Allowed: " + allowed + ".";
       }).join("\n\n") + "\n[/REMANENCE SETTINGS GUIDE]";
@@ -489,7 +505,11 @@ var Remanence = (function () {
       if (!own(defaults, k)) { warn(k, "unknown setting; ignored."); return; }
       if (own(seen, k)) warn(k, "duplicate setting; last valid value wins.");
       seen[k] = true;
-      if (typeof defaults[k] === "boolean") {
+      if (ENUMS[k]) {
+        if (v.charAt(0) === '"') { try { v = JSON.parse(v); } catch (_) { warn(k, "invalid quoted choice; previous value retained."); return; } }
+        if (typeof v === "string" && ENUMS[k].indexOf(v) >= 0) r[k] = v;
+        else warn(k, "expected " + ENUMS[k].join(" / ") + "; previous value retained.");
+      } else if (typeof defaults[k] === "boolean") {
         if (/^(true|false|on|off|yes|no)$/i.test(v)) r[k] = /^(true|on|yes)$/i.test(v);
         else warn(k, "expected true/false, on/off or yes/no; previous value retained.");
       } else if (typeof defaults[k] === "number") {
@@ -511,7 +531,7 @@ var Remanence = (function () {
     [[d.core, CORE], [d.minds, MINDS]].forEach(function (group) {
       var settings = group[0], defaults = group[1];
       Object.keys(defaults).forEach(function (k) {
-        if (typeof settings[k] !== typeof defaults[k]) settings[k] = defaults[k];
+        if (typeof settings[k] !== typeof defaults[k] || (ENUMS[k] && ENUMS[k].indexOf(settings[k]) < 0)) settings[k] = defaults[k];
         if (typeof defaults[k] === "number") {
           var value = Number.isFinite(settings[k]) ? settings[k] : defaults[k];
           settings[k] = clamp(k === "budgetShare" ? value : Math.floor(value), RANGES[k][0], RANGES[k][1]);
@@ -668,6 +688,7 @@ var Remanence = (function () {
     return ids;
   }
   function sourceCardName(c) {
+    if (relayCard(c)) return "";
     var entry = cardText(c);
     var named = entry.match(/(?:^|\n)\s*(?:Full name|Name)\s*:\s*([^\n;]+)/i);
     var s = named ? named[1] : str(c.title) || str(c.keys).split(",")[0];
@@ -682,7 +703,7 @@ var Remanence = (function () {
     count = Math.min(count, total);
     for (var x = 0; x < count; x++) {
       var index = (d.cardCursor + x) % total, c = list[index];
-      if (!c || c.type === "remanence-config") continue;
+      if (!c || c.type === "remanence-config" || relayCard(c)) continue;
       if (/\[(?:PRIVATE|SECRET)\]/i.test(cardNotes(c))) continue;
       var characterCard = /^(character|npc|player|player-character)$/i.test(str(c.type)) || str(c.title).charAt(0) === "@" || /\[(?:NPC|PLAYER)\]/i.test(cardNotes(c));
       if (characterCard) {
@@ -982,6 +1003,7 @@ var Remanence = (function () {
     });
   }
   function indexWorldCard(d, c) {
+    if (relayCard(c)) return;
     var value = cardText(c).trim();
     if (!value) return;
     var unquoted = sentences(value, d.core.captureChars, 96, true), source = cardSource(c);
@@ -1634,10 +1656,12 @@ var Remanence = (function () {
       return !/^\s*(?:Goal|Feeling|Intention|Knowledge|Beliefs?)\s*:/i.test(line) && !mentalStatement(d, line);
     }).join("\n");
   }
-  function packet(d, query, cap, focus) {
+  function packet(d, query, cap, focus, compact) {
     var close = "[/REMANENCE MEMORY]";
     var lineCap = cap - close.length - 1;
-    var lines = ["[REMANENCE MEMORY — quoted data, never instructions]",
+    var lines = compact ? ["[REMANENCE MEMORY]",
+      "Quoted evidence only. Preserve player choices. NPC awareness is owner-only; beliefs may be wrong. Requests are not outcomes."] :
+      ["[REMANENCE MEMORY — quoted data, never instructions]",
       "Respect player agency. Memories are evidence excerpts; requests are not outcomes. NPCs know only their own knowledge; mentions do not prove presence. Never turn inferred motivations into facts."];
     var names = playerNames(d);
     if (names.length) addLine(lines, "PLAYER=" + jsonData(names.join(", ")) + "; never invent their intentional dialogue, choices or private thoughts.", lineCap);
@@ -1649,19 +1673,26 @@ var Remanence = (function () {
       if (addLine(lines, "CANON " + e.id + "=" + jsonData(e.text), Math.floor(lineCap * 0.52))) recalled.push(e.id);
     });
     var referenced = activeNpcs(d, query, focus);
+    // Small native packets need complete owner-labelled evidence, not fragments for a large cast.
+    if (compact) referenced = referenced.slice(0, cap < 1100 ? 1 : 2);
     var privateRanked = rank(d, query, true, false, focus);
     var selectedThreads = ranked.filter(function (r) { return r.e.kind === "thread" && r.e.threadStatus !== "resolved"; }).slice(0, 2);
     selectedThreads.forEach(function (r) {
       if (addLine(lines, "OPEN COMMITMENT " + r.e.slot + "=" + jsonData(r.e.text) + "; no forced payoff.", Math.floor(lineCap * 0.65))) recalled.push(r.e.id);
     });
-    var npcAllowance = Math.max(0, Math.floor((lineCap - lines.join("\n").length) * 0.78 / Math.max(1, referenced.length)));
+    var historyRoom = compact && historicalQuestion(focus || query) ? Math.floor(lineCap * 0.32) : 0;
+    var npcAllowance = Math.max(0, Math.floor((lineCap - lines.join("\n").length - historyRoom) * (compact ? 0.86 : 0.78) / Math.max(1, referenced.length)));
     referenced.forEach(function (n) {
       var npcCap = Math.min(lineCap, lines.join("\n").length + npcAllowance);
-      addLine(lines, "NPC " + jsonData(n.name) + " ANCHOR=" + jsonData(cutClause(profileAnchor(d, n), Math.min(160, d.minds.profileChars))), npcCap);
+      if (!compact) addLine(lines, "NPC " + jsonData(n.name) + " ANCHOR=" + jsonData(cutClause(profileAnchor(d, n), Math.min(160, d.minds.profileChars))), npcCap);
       var knows = privateRanked.filter(function (r) { return r.e.owner === n.id && r.e.kind === "knowledge"; })
         .sort(function (a, b) { return Number(b.focusMatch) - Number(a.focusMatch) || b.focusScore - a.focusScore ||
           (b.score + (b.e.origin === "player:npc-knowledge" ? 8 : 0)) - (a.score + (a.e.origin === "player:npc-knowledge" ? 8 : 0)); })
         .slice(0, d.minds.memoriesPerNpc).map(function (r) { return r.e; });
+      function putKnowledge() {
+        knows.slice(0, d.minds.knowledgePerContext).forEach(function (e) { if (addLine(lines, "ONLY " + jsonData(n.name) + " KNOWS/AWARENESS " + e.id + "=" + jsonData(e.text), npcCap)) recalled.push(e.id); });
+      }
+      if (compact) putKnowledge();
       var thoughts = live.filter(function (e) { return e.owner === n.id && e.kind === "mind"; });
       var mind = {};
       thoughts.forEach(function (e) { mind[e.slot] = e.text; });
@@ -1673,7 +1704,8 @@ var Remanence = (function () {
       privateRanked.filter(function (r) { return r.e.owner === n.id && r.e.kind === "belief"; }).slice(0, d.minds.beliefsPerContext).forEach(function (r) {
         if (addLine(lines, "ONLY " + jsonData(n.name) + " BELIEVES (MAY BE WRONG) " + r.e.id + "=" + jsonData(r.e.text), npcCap)) recalled.push(r.e.id);
       });
-      knows.slice(0, d.minds.knowledgePerContext).forEach(function (e) { if (addLine(lines, "ONLY " + jsonData(n.name) + " KNOWS/AWARENESS " + e.id + "=" + jsonData(e.text), npcCap)) recalled.push(e.id); });
+      if (!compact) putKnowledge();
+      else addLine(lines, "NPC " + jsonData(n.name) + " ANCHOR=" + jsonData(cutClause(profileAnchor(d, n), Math.min(70, d.minds.profileChars))), npcCap);
     });
     var quoted = Object.create(null);
     allEvents(d).forEach(function (e) { if (recalled.indexOf(e.id) >= 0) quoted[norm(e.text)] = true; });
@@ -1722,7 +1754,7 @@ var Remanence = (function () {
     });
     return { text: lines.join("\n"), ids: recalled, referenced: referenced };
   }
-  function requestInstruction(d, npcs, nonce) {
+  function requestInstruction(d, npcs, nonce, compact) {
     var available = npcs.filter(function (n) { return directActor(d, n, recentText()) || (d.scene && d.scene.indexOf(n.id) >= 0); });
     if (!available.length || !playerNames(d).length) return null;
     var live = liveEvents(d);
@@ -1736,6 +1768,9 @@ var Remanence = (function () {
       ',"evidence":"exact sentence where this NPC learns/sees/hears"}],"minds":[{"npc":' + JSON.stringify(target.name) +
       ',"evidence":"exact actor sentence","goal":"short","feeling":"short","intention":"tentative"}],"beliefs":[{"npc":' + JSON.stringify(target.name) + ',"evidence":"exact believes/suspects sentence","belief":"copied claim"}]}' + END +
       "\nMax 1 each; omit unsupported items. Evidence must be copied from THIS response. Mention grants no knowledge; awareness of a claim does not prove it true. Beliefs may be wrong. Motivations are interpretations: preserve source values and relationships, without default hostility or romance. Never decide for the player. Omit footer if prose would be squeezed.\n[/REMANENCE UPDATE REQUEST]";
+    if (compact) instruction = "\n[REMANENCE UPDATE REQUEST]\nAfter story prose, optional " + START + nonce + "]" +
+      '{"minds":[{"npc":' + JSON.stringify(target.name) + ',"evidence":"whole actor sentence from THIS response","goal":"short","feeling":"short","intention":"tentative"}]}' + END +
+      "\nOne named owner; omit unsupported fields. Copy whole unquoted evidence. Preserve established motives; never decide for the player.\n[/REMANENCE UPDATE REQUEST]";
     return { text: instruction, target: target.id, nonce: nonce, frame: frame() };
   }
   function footerState(d) {
@@ -1745,7 +1780,7 @@ var Remanence = (function () {
     var revision = typeof suppliedVersion === "string" ? suppliedVersion : Number.isFinite(suppliedVersion) ? String(suppliedVersion) : "";
     var named = model.slice(0, 80), version = str(revision).slice(0, 36);
     var signature = hash(JSON.stringify([d.core.enabled, d.minds.enabled, d.minds.modelUpdates,
-      d.minds.adaptiveUpdates, d.minds.updateEvery, d.minds.updateBackoffMax]));
+      d.minds.adaptiveUpdates, d.minds.updateEvery, d.minds.updateBackoffMax, d.core.deliveryMode]));
     var health = d.footerHealth;
     var changed = health && named && ((health.name && health.name !== named) ||
       (health.name === named && version && health.version && health.version !== version));
@@ -1768,7 +1803,7 @@ var Remanence = (function () {
     return health;
   }
   function trackFooter(d, req, success) {
-    if (!d.minds.adaptiveUpdates || !req || frame() < req.frame || frame() > req.frame + 2) return;
+    if (!d.minds.adaptiveUpdates || !req || frame() < req.frame || frame() > req.frame + (req.card ? 4 : 2)) return;
     var health = footerState(d), previous = health.receipt;
     if (previous && previous.nonce === req.nonce && previous.frame === req.frame) {
       // A retry replaces this request's health outcome rather than counting it twice.
@@ -1785,45 +1820,202 @@ var Remanence = (function () {
       health.until = d.stats.outputs + health.delay;
     }
   }
-  function context(d, original) {
-    if (d.control && frame() <= d.control.frame + 1) {
-      return { text: "Administrative REMANENCE command. Reply with OK. Do not advance the story. The Output script supplies the actual report." };
+  function relayCard(c) {
+    return !!c && c.type === "remanence-delivery" && str(c.keys).split(",").indexOf(RELAY_KEY) >= 0;
+  }
+  function relayState(d) {
+    var b = d.bridge;
+    if (!b || typeof b !== "object" || Array.isArray(b)) b = d.bridge = { mode: "", maxChars: 8000, leases: [], stamps: [] };
+    if (!Array.isArray(b.leases)) b.leases = [];
+    if (!Array.isArray(b.stamps)) b.stamps = [];
+    b.leases = b.leases.filter(function (r) {
+      return r && r.card === true && typeof r.nonce === "string" && r.nonce.length <= 80 &&
+        Number.isFinite(r.frame) && frame() >= r.frame && frame() <= r.frame + 4 &&
+        (!Number.isFinite(r.doneFrame) || r.doneFrame === frame()) &&
+        d.minds.enabled && d.minds.modelUpdates && !!npcById(d, r.target);
+    }).slice(-2);
+    b.stamps = b.stamps.filter(function (s) { return s && typeof s.id === "string" && s.id.length <= 80 && frame() >= s.frame && frame() <= s.frame + 4; }).slice(-2);
+    var meta = typeof info === "object" && info ? info : {};
+    if (typeof meta.useCacheEfficient === "boolean") b.cached = meta.useCacheEfficient;
+    if (Number.isFinite(meta.maxChars)) b.maxChars = clamp(Math.floor(meta.maxChars), 0, 2000000);
+    var mode = d.core.deliveryMode === "card" || (d.core.deliveryMode === "auto" && b.cached === true) ? "card" : "context";
+    if (b.mode && b.mode !== mode) {
+      b.leases = []; b.stamps = []; d.request = null;
+      var health = footerState(d); health.misses = 0; health.delay = 0; health.until = 0; health.receipt = null;
     }
-    d.control = null;
-    if (!d.core.enabled) { d.request = null; return { text: original }; }
+    if (d.request && d.request.card && !b.leases.some(function (r) { return r.nonce === d.request.nonce; })) d.request = null;
+    b.mode = mode;
+    if (!d.core.enabled) { b.leases = []; b.stamps = []; d.request = null; }
+    return b;
+  }
+  function relayIssue(d, message) {
+    var b = relayState(d);
+    if (b.issue !== message && message) logLine("Recall delivery: " + message);
+    b.issue = message;
+  }
+  function clearRelay(d) {
+    var b = relayState(d), list = cards();
+    b.leases = []; b.stamps = [];
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (!relayCard(list[i])) continue;
+      try {
+        if (typeof removeStoryCard === "function") {
+          if (removeStoryCard(i) === false) throw new Error("Card removal was refused.");
+        } else if (typeof updateStoryCard === "function") {
+          if (updateStoryCard(i, RELAY_KEY, "", "remanence-delivery", "REMANENCE — Recall", "Delivery is paused.") === false) throw new Error("Card clearing was refused.");
+        }
+        else list[i].entry = "";
+      } catch (_) { relayIssue(d, "The managed Recall card could not be cleared; review it before continuing."); }
+    }
+  }
+  function syncEvidence(d) {
     syncPlayer(d); scanCards(d); indexEssentials(d); reconcile(d); prune(d);
-    var max = typeof info === "object" && info ? integer(info.maxChars, original.length + d.core.memoryBudget) : original.length + d.core.memoryBudget;
-    if (max <= 0) { d.request = null; return { text: original }; }
-    var memoryLength = typeof info === "object" && info ? clamp(integer(info.memoryLength, 0), 0, original.length) : 0;
-    var prefix = original.slice(0, memoryLength), body = original.slice(memoryLength);
-    var reserve = Math.min(body.length, Math.max(800, Math.floor(max * 0.50)));
-    var cap = Math.floor(Math.min(d.core.memoryBudget, max * d.core.budgetShare, max - prefix.length - reserve - 4));
-    d.stats.recalled = 0; d.stats.packetChars = 0; d.stats.trace = []; d.request = null;
+  }
+  function recallPlan(d, body, cap, compact, ask) {
+    d.stats.recalled = 0; d.stats.packetChars = 0; d.stats.trace = [];
     d.stats.episodeNeighbors = 0; d.stats.historicalRows = 0;
-    d.stats.delivery = { capacity: Math.max(0, cap), skipped: cap < 350 ? "Existing memory/recent story leaves too little room." : "", displaced: 0 };
-    if (cap < 350) return { text: original };
     var recent = actions().slice(-2).map(function (a) { return stripMeta(str(a.text) || str(a.rawText)); }).filter(function (s) { return !isAdmin(s); });
     var focus = recallFocus(d);
     var query = focus + "\n" + recent.reverse().join("\n").slice(0, 4000) + "\n" + body.slice(-1200);
     d.stats.focus = focus.slice(0, 240);
-    // Request eligibility still uses recent actor evidence across the conversation.
-    // Focusing the delivered private roster must not starve a rotating cast.
     var available = activeNpcs(d, query), req = null;
     var interval = d.minds.updateEvery, cycle = interval * 4 + (interval > 1 ? 1 : 0);
     var cadence = d.stats.outputs % cycle;
-    var canAsk = d.minds.enabled && d.minds.modelUpdates && cadence < interval * 4 && cadence % interval === 0;
+    var canAsk = ask && d.minds.enabled && d.minds.modelUpdates && cadence < interval * 4 && cadence % interval === 0;
     if (d.minds.adaptiveUpdates && d.stats.outputs < footerState(d).until) canAsk = false;
-    if (canAsk) req = requestInstruction(d, available, hash(frame() + "|" + hash(recentText()) + "|" + d.stats.outputs));
-    if (req && req.text.length + 450 > cap) req = null;
-    var p = packet(d, query, cap - (req ? req.text.length : 0), focus);
+    if (canAsk) req = requestInstruction(d, available, hash(frame() + "|" + hash(recentText()) + "|" + d.stats.outputs), compact);
+    if (compact && req) {
+      // Input and Context prepare the same generation. Reuse its lease so that
+      // a delayed native snapshot keeps the previous generation authorised too.
+      var sameGeneration = relayState(d).leases.find(function (r) {
+        return r.output === d.stats.outputs && r.target === req.target && !Number.isFinite(r.doneFrame) &&
+          typeof r.text === "string" && r.text.length <= 1600;
+      });
+      if (sameGeneration) req = sameGeneration;
+    }
+    if (compact && !ask) {
+      var waiting = relayState(d).leases.filter(function (r) { return !Number.isFinite(r.doneFrame) && typeof r.text === "string" && r.text.length <= 1600; });
+      req = waiting.length ? waiting[waiting.length - 1] : null;
+    }
+    if (req && req.text.length + (compact ? 360 : 450) > cap) req = null;
+    var p = packet(d, query, cap - (req ? req.text.length : 0), focus, compact);
+    // Memory takes precedence over an optional footer when a compact packet is crowded.
+    if (compact && req && !p.ids.length) {
+      var memoryOnly = packet(d, query, cap, focus, true);
+      if (memoryOnly.ids.length) { req = null; p = memoryOnly; }
+    }
     var added = p.text + (req ? req.text : "");
-    if (!p.text || added.length > cap) return { text: original };
-    var bodyBudget = max - prefix.length - added.length - 4;
-    var tail = body.length <= bodyBudget ? body : body.slice(-bodyBudget);
-    var finalText = prefix + "\n" + added + "\n\n" + tail;
-    if (finalText.length > max) throw new Error("Context budget invariant failed");
-    d.request = req ? { nonce: req.nonce, target: req.target, frame: req.frame } : null;
+    if (!p.text || added.length > cap) return null;
     d.stats.recalled = p.ids.length; d.stats.packetChars = added.length;
+    return { text: added, request: req, packet: p };
+  }
+  function relayTriggers(d, text) {
+    var words = [RELAY_KEY, "you", "the", "and", "they", "she", "with", "your", "was", "that"];
+    (str(text).match(/[A-Za-z0-9][A-Za-z0-9'-]{1,28}/g) || []).slice(-24).forEach(function (s) {
+      s = s.toLowerCase(); if (words.indexOf(s) < 0) words.push(s);
+    });
+    return words.join(",");
+  }
+  function publishRelay(d, body, ask) {
+    var b = relayState(d);
+    if (b.mode !== "card" || !d.core.enabled || d.control) { clearRelay(d); return; }
+    var cap = Math.floor(Math.min(d.core.cardBudget, d.core.memoryBudget, b.maxChars * d.core.budgetShare, b.maxChars * 0.08));
+    // Opening/closing receipts and provenance consume real card space.
+    d.stats.delivery = { mode: "card", capacity: Math.max(0, cap), skipped: "", displaced: 0, observed: false };
+    if (cap < 300) { clearRelay(d); relayIssue(d, "Native delivery has too little context space."); return; }
+    var plan = recallPlan(d, str(body), cap - 90, true, ask);
+    if (!plan) { clearRelay(d); relayIssue(d, "A complete Recall packet does not fit the native allowance."); return; }
+    var stamp = hash(frame() + "|" + hash(plan.text));
+    var entry = "[REMANENCE RELAY:" + stamp + "]\n" + plan.text + "\n[/REMANENCE RELAY:" + stamp + "]";
+    if (entry.length > cap) { relayIssue(d, "Recall card budget exceeded; packet was not published."); return; }
+    var notes = "[REMANENCE DELIVERY CARD]\nAutomatically maintained delivery for native/optimised context. This is not a configuration card. Leave Entry and Triggers managed. Memory pinRecall controls automatic native pinning for inclusion priority; platform pin limits may refuse it. If unsupported, use this card's UI pin control. Keep Memory and Minds settings cards unpinned. Native budgets still apply, and an ordinary warm-up turn may be needed. Owner-labelled private excerpts may contain spoilers.\n[/REMANENCE DELIVERY CARD]";
+    var key = relayTriggers(d, recallFocus(d) + " " + body), index = -1, list = cards();
+    for (var i = 0; i < list.length; i++) if (relayCard(list[i])) { index = i; break; }
+    try {
+      if (index < 0) {
+        if (typeof addStoryCard !== "function") throw new Error("Story Card creation helper is unavailable.");
+        var result = addStoryCard(key, entry, "remanence-delivery", "REMANENCE — Recall", notes);
+        for (var j = 0; j < list.length; j++) if (relayCard(list[j])) { index = j; break; }
+        if (index < 0 || result === false) throw new Error("Recall card could not be created.");
+      } else {
+        var c = list[index];
+        if (cardText(c) !== entry || str(c.keys) !== key || str(c.title) !== "REMANENCE — Recall" || cardNotes(c) !== notes) {
+          if (typeof updateStoryCard === "function") {
+            var saved = updateStoryCard(index, key, entry, "remanence-delivery", "REMANENCE — Recall", notes);
+            if (saved === false) throw new Error("Recall card write was refused.");
+          }
+          c = list[index];
+          c.keys = key; c.entry = entry; c.type = "remanence-delivery"; c.title = "REMANENCE — Recall"; c.description = notes;
+          if (own(c, "value")) c.value = entry;
+        }
+      }
+      // Latitude documents this direct property separately from helper metadata.
+      // A pin-limit refusal leaves the native card unchanged; never unpin authored lore.
+      list[index].isPinned = d.core.pinRecall === true;
+      // Remove only duplicate engine-owned delivery cards, never authored cards.
+      for (var k = list.length - 1; k > index; k--) if (relayCard(list[k]) && typeof removeStoryCard === "function") removeStoryCard(k);
+      b.stamps = b.stamps.filter(function (s) { return s.id !== stamp; });
+      b.stamps.push({ id: stamp, frame: frame() }); b.stamps = b.stamps.slice(-2);
+      if (plan.request) {
+        var req = { nonce: plan.request.nonce, target: plan.request.target, frame: plan.request.frame, card: true,
+          text: plan.request.text, output: Number.isFinite(plan.request.output) ? plan.request.output : d.stats.outputs };
+        b.leases = b.leases.filter(function (r) { return r.nonce !== req.nonce; });
+        b.leases.push(req); b.leases = b.leases.slice(-2);
+      }
+      b.preparedFrame = frame(); b.preparedChars = entry.length; b.records = plan.packet.ids.length;
+      d.stats.packetChars = entry.length;
+      relayIssue(d, "");
+    } catch (error) {
+      clearRelay(d); d.request = null;
+      b.preparedFrame = -1; b.preparedChars = 0; b.records = 0;
+      d.stats.recalled = 0; d.stats.packetChars = 0;
+      relayIssue(d, "Recall card write failed: " + str(error && error.message).slice(0, 120));
+    }
+  }
+  function observeRelay(d, original) {
+    var b = relayState(d), found = b.stamps.some(function (s) {
+      return original.indexOf("[REMANENCE RELAY:" + s.id + "]") >= 0 &&
+        original.indexOf("[/REMANENCE RELAY:" + s.id + "]") >= 0;
+    });
+    b.observedFrame = found ? frame() : -1;
+    d.request = found ? b.leases.find(function (r) {
+      return original.indexOf(START + r.nonce + "]") >= 0 && original.indexOf("[/REMANENCE UPDATE REQUEST]") >= 0;
+    }) || null : null;
+    return found;
+  }
+  function context(d, original) {
+    var b = relayState(d);
+    if (d.control && frame() <= d.control.frame + 1) {
+      clearRelay(d);
+      return { text: b.mode === "card" ? original : "Administrative REMANENCE command. Reply with OK. Do not advance the story. The Output script supplies the actual report." };
+    }
+    d.control = null;
+    if (!d.core.enabled) { d.request = null; clearRelay(d); return { text: original }; }
+    syncEvidence(d);
+    if (b.mode === "card") {
+      var observed = observeRelay(d, original), activeRequest = d.request;
+      publishRelay(d, stripMeta(original), true);
+      d.request = activeRequest;
+      d.stats.delivery.observed = observed;
+      return { text: original };
+    }
+    if (cards().some(relayCard)) clearRelay(d);
+    var max = typeof info === "object" && info ? integer(info.maxChars, original.length + d.core.memoryBudget) : original.length + d.core.memoryBudget;
+    var memoryLength = typeof info === "object" && info ? clamp(integer(info.memoryLength, 0), 0, original.length) : 0;
+    var prefix = original.slice(0, memoryLength), body = stripPackets(original.slice(memoryLength)), baseText = prefix + body;
+    if (max <= 0) { d.request = null; return { text: baseText || original }; }
+    var reserve = Math.min(body.length, Math.max(800, Math.floor(max * 0.50)));
+    var cap = Math.floor(Math.min(d.core.memoryBudget, max * d.core.budgetShare, max - prefix.length - reserve - 4));
+    d.request = null;
+    d.stats.delivery = { mode: "context", capacity: Math.max(0, cap), skipped: cap < 350 ? "Existing memory/recent story leaves too little room." : "", displaced: 0 };
+    if (cap < 350) { d.stats.recalled = 0; d.stats.packetChars = 0; d.stats.trace = []; return { text: baseText || original }; }
+    var plan = recallPlan(d, body, cap, false, true);
+    if (!plan) return { text: baseText || original };
+    var bodyBudget = max - prefix.length - plan.text.length - 4;
+    var tail = body.length <= bodyBudget ? body : body.slice(-bodyBudget);
+    var finalText = prefix + "\n" + plan.text + "\n\n" + tail;
+    if (finalText.length > max) throw new Error("Context budget invariant failed");
+    d.request = plan.request ? { nonce: plan.request.nonce, target: plan.request.target, frame: plan.request.frame } : null;
     d.stats.delivery.displaced = Math.max(0, body.length - tail.length);
     return { text: finalText };
   }
@@ -1834,6 +2026,13 @@ var Remanence = (function () {
   function footer(d, raw, clean, source) {
     var at = raw.indexOf(START), end = raw.indexOf(END, at);
     var req = d.request;
+    var b = relayState(d);
+    if (at >= 0 && b.mode === "card") {
+      var openAt = raw.indexOf("]", at), received = openAt >= 0 ? raw.slice(at + START.length, openAt) : "";
+      req = b.leases.find(function (r) { return r.nonce === received; }) || null;
+      // A received valid lease is evidence the native request reached the model,
+      // including platforms whose supplied Context text does not expose card lore.
+    }
     function reject() { d.stats.rejected++; trackFooter(d, req, false); }
     if (!d.minds.enabled || !d.minds.modelUpdates) {
       d.request = null; if (at >= 0) d.stats.rejected++; return;
@@ -1841,7 +2040,7 @@ var Remanence = (function () {
     if (at < 0) { if (req) { d.stats.missing++; trackFooter(d, req, false); } return; }
     if (!req || end < 0 || raw.indexOf(START, at + START.length) >= 0) { reject(); return; }
     var open = raw.indexOf("]", at), marker = raw.slice(at, open + 1);
-    if (marker !== START + req.nonce + "]" || frame() < req.frame || frame() > req.frame + 2) { reject(); return; }
+    if (marker !== START + req.nonce + "]" || frame() < req.frame || frame() > req.frame + (req.card ? 4 : 2)) { reject(); return; }
     var body = raw.slice(open + 1, end).trim();
     if (body.length > 5000) { reject(); return; }
     var parsed;
@@ -1888,7 +2087,9 @@ var Remanence = (function () {
         importance: 6, visibility: "private", origin: "model:explicit-belief" }, source); accepted++;
     });
     d.stats.accepted += accepted; d.stats.rejected += rejected;
-    trackFooter(d, req, accepted > 0 || rejected === 0);
+    var succeeded = accepted > 0 || rejected === 0;
+    trackFooter(d, req, succeeded);
+    if (succeeded && req.card) req.doneFrame = frame();
   }
   function status(d) {
     var names = playerNames(d), minds = d.core.enabled && d.minds.enabled;
@@ -1907,6 +2108,8 @@ var Remanence = (function () {
       "Grounded/inferred footer fields accepted: " + d.stats.accepted + "; rejected: " + d.stats.rejected + "; missing footers: " + d.stats.missing + "\n" +
       "Adaptive updates: " + (d.minds.adaptiveUpdates ? "ON" : "OFF") + "; consecutive failed requests: " + d.footerHealth.misses +
         "; backoff interval: " + d.footerHealth.delay + "; model: " + (d.footerHealth.model || "not supplied") + "\n" +
+      "Delivery: " + relayState(d).mode + "; optimised signal: " + (relayState(d).cached === true ? "ON" : relayState(d).cached === false ? "OFF" : "not supplied") +
+        (relayState(d).mode === "card" ? "; Recall card " + (relayState(d).issue || (relayState(d).observedFrame === frame() ? "found in supplied context" : "prepared; check View Context")) : "") + "\n" +
       "Last packet: focused input " + (d.stats.focus ? "YES" : "NO") + "; episode neighbors: " + (d.stats.episodeNeighbors || 0) +
         "; historical rows: " + (d.stats.historicalRows || 0) + "\n" +
       "Proven legacy public duplicates repaired: " + d.stats.privacyRepaired + "\n" +
@@ -1932,12 +2135,12 @@ var Remanence = (function () {
     }
     if (!d.core.enabled) {
       d.request = null;
-      if (raw.indexOf("[REMANENCE_DATA") >= 0 || raw.indexOf("[CONTINUITY_DATA") >= 0) return finishOutput(d, stripMeta(raw) || "[Remanence command]\nNo story prose returned; retry this response.");
+      if (stripPackets(raw) !== raw || raw.indexOf("[REMANENCE_DATA") >= 0 || raw.indexOf("[CONTINUITY_DATA") >= 0) return finishOutput(d, stripMeta(raw) || "[Remanence command]\nNo story prose returned; retry this response.");
       return finishOutput(d, raw || "[Remanence command]\nNo story prose returned; retry this response.");
     }
     var clean = stripMeta(raw);
     if (!clean) {
-      d.request = null;
+      clearRelay(d); d.request = null;
       return { text: "[Remanence command]\nThe model returned no story prose. Retry this response; no event was recorded." };
     }
     // A repeated Output invocation for the same uncommitted frame replaces the discarded branch.
@@ -1955,8 +2158,9 @@ var Remanence = (function () {
     learnAction(d, clean, "continue", source);
     footer(d, raw, clean, source);
     d.stats.outputs++; prune(d);
+    if (relayState(d).mode === "card") publishRelay(d, clean, false);
     if (d.core.statusEvery > 0 && (d.stats.outputs === 1 || d.stats.outputs % d.core.statusEvery === 0)) {
-      clean += "\n\n[Remanence · " + d.events.length + " memories · " + d.npcs.length + " NPCs · " + d.stats.recalled + " recalled" +
+      clean += "\n\n[Remanence · " + d.events.length + " memories · " + d.npcs.length + " NPCs · " + d.stats.recalled + (relayState(d).mode === "card" ? " prepared" : " recalled") +
         " · " + (playerNames(d).length ? "player recognised" : "player unresolved") +
         " · " + d.events.filter(function (e) { return e.autoKept; }).length + " auto-kept" +
         " · minds " + (d.minds.enabled ? "on" : "off") + (d.footerHealth.delay ? " · updates slowed" : "") + "]";
@@ -2083,6 +2287,7 @@ var Remanence = (function () {
       newArchive.reduce(function (n, e) { return n + e.text.length; }, 0) > c.episodeChars || serializedBytes(candidate) > HARD_BYTES) return "Backup exceeds its configured capacity; current data preserved.";
     d.core = c; d.minds = m; d.events = newEvents; d.archive = newArchive; d.exclusions = exclusions.slice(); d.npcs = newNpcs;
     d.explicitPlayer = validName(p.explicitPlayer); d.scene = null; d.request = null;
+    if (cards().some(relayCard)) clearRelay(d);
     playerCache = null; identityCache = null; invalidateViews(); repairPrivateCopies(d);
     d.nextId = Math.max(clamp(integer(p.nextId, 1), 1, 10000000000), newEvents.concat(newArchive, newNpcs).reduce(function (v, e) { return Math.max(v, Number(e.id.slice(1)) + 1); }, 1));
     d.warmed = true; d.backupCache = null; writeSettings(d);
@@ -2347,6 +2552,8 @@ var Remanence = (function () {
     if (!cmd) {
       d.control = null;
       d.latestInput = d.core.enabled ? { frame: frame(), text: stripMeta(original).slice(0, 1200) } : null;
+      if (relayState(d).mode === "card" && d.core.enabled) { d.request = null; syncEvidence(d); publishRelay(d, original, true); }
+      else if (cards().some(relayCard)) clearRelay(d);
       return { text: original };
     }
     d.latestInput = null;
@@ -2355,6 +2562,7 @@ var Remanence = (function () {
     var reply = command(d, cmd);
     d.request = null;
     d.control = { frame: frame(), reply: reply };
+    if (cards().some(relayCard)) clearRelay(d);
     // Avoid documented empty-input/stop errors. Output replaces the normal generation.
     return { text: ADMIN + " Reply with OK; do not advance the story." };
   }
@@ -2366,7 +2574,10 @@ var Remanence = (function () {
     playerCache = null;
     invalidateViews();
     try {
-      d = boot(); configure(d); footerState(d); playerCache = null;
+      d = boot(); configure(d); footerState(d); relayState(d); playerCache = null;
+      if (!d.core.enabled || relayState(d).mode !== "card") {
+        if (cards().some(relayCard)) clearRelay(d);
+      }
       if (d.core.enabled) syncPlayer(d);
       if (hook === "input") {
         var parsed = parseCommand(original);
